@@ -1,3 +1,4 @@
+import json
 import os
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -6,18 +7,20 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+from clt.config import CLTConfig
+from clt.models.clt import CrossLayerTranscoder
 from jaxtyping import Array, Float, Int
-from sparsify import SparseCoder
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers.models.llama import LlamaPreTrainedModel
-from transformers.models.gpt_neo import GPTNeoPreTrainedModel
-from transformers.models.gpt2 import GPT2PreTrainedModel
-from transformers.models.gpt2.modeling_gpt2 import eager_attention_forward as gpt2_eager_attention_forward
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from loguru import logger
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+from transformers.models.gpt2 import GPT2PreTrainedModel
+from transformers.models.gpt2.modeling_gpt2 import (
+    eager_attention_forward as gpt2_eager_attention_forward,
+)
+from transformers.models.gpt_neo import GPTNeoPreTrainedModel
+from transformers.models.llama import LlamaPreTrainedModel
 
 from .utils import repeat_kv
-
 
 GPT2Like = GPT2PreTrainedModel | GPTNeoPreTrainedModel
 
@@ -37,6 +40,7 @@ class AttentionOutputs:
     ln_factor: Float[Array, "batch seq_len hidden_size"]
     attn_values: Float[Array, "batch num_attention_heads seq_len head_dim"]
     attn_patterns: Float[Array, "batch num_attention_heads seq_len seq_len"]
+
 
 @dataclass
 class TranscodedOutputs:
@@ -79,32 +83,56 @@ class TranscodedModel(object):
         if transcoder_path is None:
             return
         if hookpoint_fn is None:
+
             def hookpoint_fn(hookpoint):
                 if isinstance(model, LlamaPreTrainedModel):
                     return hookpoint.replace("model.layers.", "layers.")
                 elif isinstance(model, GPT2Like):
                     return hookpoint.replace("transformer.h.", "h.")
                 else:
-                    logger.warning(f"Unknown model type: {type(model)}. Using default hookpoint.")
+                    logger.warning(
+                        f"Unknown model type: {type(model)}. Using default hookpoint."
+                    )
                     return hookpoint
-        self.hookpoints_mlp = [f"{self.layer_prefix}.{i}.mlp" for i in range(self.num_layers)]
+
+        self.hookpoints_mlp = [
+            f"{self.layer_prefix}.{i}.mlp" for i in range(self.num_layers)
+        ]
         self.temp_hookpoints_mlp = [
             hookpoint_fn(hookpoint) for hookpoint in self.hookpoints_mlp
         ]
+
         logger.info(f"Loading transcoders from {transcoder_path}")
         transcoder_path = Path(transcoder_path)
-        self.transcoders = {}
-        for hookpoint, temp_hookpoint in zip(self.hookpoints_mlp, self.temp_hookpoints_mlp):
-            sae = SparseCoder.load_from_disk(
-                transcoder_path / temp_hookpoint,
-                device=device,
-            )
-            self.transcoders[hookpoint] = sae
-        self.hookpoints_layer = [f"{self.layer_prefix}.{i}" for i in range(self.num_layers)]
-        self.hookpoints_ln = [f"{self.layer_prefix}.{i}.{self.mlp_layernorm_name}" for i in range(self.num_layers)]
-        self.hookpoints_attn_ln = [f"{self.layer_prefix}.{i}.{self.attn_layernorm_name}" for i in range(self.num_layers)]
+
+        clt_cfg_path = os.path.join(transcoder_path, "cfg.json")
+        clt_ckpt_path = os.path.join(transcoder_path, "clt_checkpoint_latest.pt")
+
+        with open(clt_cfg_path, "r") as f:
+            config_dict = json.load(f)
+        clt_config = CLTConfig(**config_dict)
+
+        # Create and load model
+        clt = CrossLayerTranscoder(clt_config, process_group=None, device=device)
+        clt.load_state_dict(torch.load(clt_ckpt_path, map_location=device))
+
+        self.hookpoints_layer = [
+            f"{self.layer_prefix}.{i}" for i in range(self.num_layers)
+        ]
+        self.hookpoints_ln = [
+            f"{self.layer_prefix}.{i}.{self.mlp_layernorm_name}"
+            for i in range(self.num_layers)
+        ]
+        self.hookpoints_attn_ln = [
+            f"{self.layer_prefix}.{i}.{self.attn_layernorm_name}"
+            for i in range(self.num_layers)
+        ]
         self.name_to_module = {
-            name: model.get_submodule(name) for name in self.hookpoints_layer + self.hookpoints_mlp + self.hookpoints_ln + self.hookpoints_attn_ln
+            name: model.get_submodule(name)
+            for name in self.hookpoints_layer
+            + self.hookpoints_mlp
+            + self.hookpoints_ln
+            + self.hookpoints_attn_ln
         }
         self.name_to_index = {
             k: i
@@ -125,14 +153,25 @@ class TranscodedModel(object):
     def repeat_kv(self):
         if not hasattr(self.model.config, "num_key_value_heads"):
             return 1
-        return self.model.config.num_attention_heads // self.model.config.num_key_value_heads
+        return (
+            self.model.config.num_attention_heads
+            // self.model.config.num_key_value_heads
+        )
 
-    def __call__(self, prompt: str | torch.Tensor, mask_features: dict[int, list[int]] = {},
-                 errors_from: TranscodedOutputs | None = None,
-                 no_error: bool = False) -> TranscodedOutputs:
+    def __call__(
+        self,
+        prompt: str | torch.Tensor,
+        mask_features: dict[int, list[int]] = {},
+        errors_from: TranscodedOutputs | None = None,
+        no_error: bool = False,
+    ) -> TranscodedOutputs:
         if isinstance(prompt, str):
-            tokenized_prompt = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-            logger.info(f"Tokenized prompt: {[self.decode_token(i) for i in tokenized_prompt.input_ids[0]]}")
+            tokenized_prompt = self.tokenizer(prompt, return_tensors="pt").to(
+                self.device
+            )
+            logger.info(
+                f"Tokenized prompt: {[self.decode_token(i) for i in tokenized_prompt.input_ids[0]]}"
+            )
         elif isinstance(prompt, torch.Tensor):
             tokenized_prompt = SimpleNamespace(input_ids=prompt.to(self.device))
         else:
@@ -149,7 +188,6 @@ class TranscodedModel(object):
             save_dict[self.module_to_name[module]] = multiplier
             return (input[0] - mean) * multiplier + module.bias
 
-
         def get_attention_values_hook(module, input, output):
             # this hook is in the layer
             residual = input[0]
@@ -161,104 +199,83 @@ class TranscodedModel(object):
             hidden_shape = (*input_shape, -1, self.head_dim)
 
             layer_idx = self.name_to_index[layer_name]
-            value_states = self.project_v(layer_idx, layer_normed).view(hidden_shape).transpose(1, 2)
+            value_states = (
+                self.project_v(layer_idx, layer_normed)
+                .view(hidden_shape)
+                .transpose(1, 2)
+            )
             values = repeat_kv(value_states, self.repeat_kv)
             attn_values[layer_name] = values
 
         for hookpoint in self.hookpoints_layer:
-            self.name_to_module[hookpoint].register_forward_hook(get_attention_values_hook)
+            self.name_to_module[hookpoint].register_forward_hook(
+                get_attention_values_hook
+            )
             ln = getattr(self.name_to_module[hookpoint], self.attn_layernorm_name)
             ln.register_forward_hook(partial(ln_record_hook, save_dict=first_ln))
             self.freeze_attention_pattern(hookpoint)
 
         second_ln = {}
         for hookpoint in self.hookpoints_ln:
-            self.name_to_module[hookpoint].register_forward_hook(partial(ln_record_hook, save_dict=second_ln))
+            self.name_to_module[hookpoint].register_forward_hook(
+                partial(ln_record_hook, save_dict=second_ln)
+            )
 
-        transcoder_outputs = {}
-        target_transcoder_activations = {}
-        source_transcoder_activations = {}
-        transcoder_locations = {}
         errors = {}
+        activations = {}
+        reconstructions = {}
 
         def get_mlp_hook(module, input, output):
             if isinstance(input, tuple):
                 input = input[0]
 
             module_name = self.module_to_name[module]
-            transcoder = self.transcoders[module_name]
-            # have to reshape input to lose the batch dimension
-            batch_dims = input.shape[:-1]
-            input = input.view(-1, input.shape[-1])
-            # have to normalize input
-            transcoder_acts = transcoder(input, return_mid_decoder=True)
-
-            target_latent_acts = transcoder_acts.latent_acts.clone().unflatten(0, batch_dims)
-            source_latent_acts = transcoder_acts.latent_acts
-            source_latent_acts = source_latent_acts.unflatten(0, batch_dims).clone()
-            source_latent_acts.detach_()
-            source_latent_acts.requires_grad_(True)
-            flat_source_acts = source_latent_acts.flatten(0, -2)
-            transcoder_acts.latent_acts = flat_source_acts
 
             layer_idx = self.name_to_index[module_name]
+            latent_acts = self.clt.encode(input, layer_idx)
+
             masked_features = mask_features.get(layer_idx, [])
             if masked_features:
-                acts = transcoder_acts.latent_acts
-                indices = transcoder_acts.latent_indices
-                # TODO: when patching, we can't use automatic attribution
-                transcoder_acts.latent_acts = acts * (1 - torch.any(torch.stack([indices == i for i in masked_features], dim=0), dim=0).float())
+                # TODO: CHECK THIS
+                mask = torch.ones_like(latent_acts)
+                mask[masked_features] = 0
+                latent_acts = latent_acts * mask.float()
 
-            transcoder_outputs[module_name] = transcoder_acts
+            activations[layer_idx] = latent_acts
 
-            sae_out = 0
-            to_delete = set()
-            for k, v in transcoder_outputs.items():
-                # divide_by = max(1, len(transcoder_outputs) - 1)
-                divide_by = 1
-                out = v(
-                    None,
-                    addition=(0 if k != module_name else sae_out) / divide_by,
-                    no_extras=k != module_name,
-                )
-                if k == module_name:
-                    sae_out = out.sae_out
-                else:
-                    sae_out += out.sae_out
-                if out.is_last:
-                    to_delete.add(k)
-            for k in to_delete:
-                del transcoder_outputs[k]
-            # have to reshape output to get the batch dimension back
-            transcoder_out = sae_out.view(output.shape)
-            diff = output - transcoder_out
+            relevant_activations = {
+                k: v for k, v in activations.items() if k <= layer_idx and v.numel() > 0
+            }
+            reconstructions[layer_idx] = self.clt.decode(
+                relevant_activations, layer_idx
+            )
 
+            diff = output - reconstructions[layer_idx]
             if no_error:
                 error = torch.zeros_like(output)
             elif errors_from is None:
                 error = diff
             else:
                 error = errors_from.mlp_outputs[layer_idx].error
+
             error = error.clone()
             error.detach_()
             error.requires_grad_(True)
             logger.info(f"Layer {module_name} error: {diff.norm() / output.norm()}")
 
-            latent_indices = transcoder_acts.latent_indices.unflatten(0, batch_dims)
-            target_transcoder_activations[module_name] = target_latent_acts
-            source_transcoder_activations[module_name] = source_latent_acts
-            transcoder_locations[module_name] = latent_indices
-
-            result = (transcoder_out + error).to(output)
+            result = (reconstructions[layer_idx] + error).to(output)
             errors[module_name] = error
             return result
 
         for hookpoint in self.hookpoints_mlp:
             self.name_to_module[hookpoint].register_forward_hook(get_mlp_hook)
 
-        outputs = self.model(input_ids=tokenized_prompt.input_ids,
-                            #  attention_mask=tokenized_prompt.attention_mask,
-                             output_attentions=True, output_hidden_states=True)
+        outputs = self.model(
+            input_ids=tokenized_prompt.input_ids,
+            #  attention_mask=tokenized_prompt.attention_mask,
+            output_attentions=True,
+            output_hidden_states=True,
+        )
         self.clear_hooks()
 
         attention_patterns = outputs.attentions
@@ -278,11 +295,21 @@ class TranscodedModel(object):
 
         mlp_outputs = {}
         for i in range(self.num_layers):
+            source_activation = activations[i].clone()
+            indices = source_activation.nonzero()
+            source_activation = source_activation[indices]
+            source_activation.detach_()
+            source_activation.requires_grad_(True)
+
+            target_activation = activations[i].clone()
+            indices = target_activation.nonzero()
+            target_activation = target_activation[indices]
+
             mlp_outputs[i] = MLPOutputs(
                 ln_factor=second_ln[self.hookpoints_ln[i]],
-                activation=target_transcoder_activations[self.hookpoints_mlp[i]],
-                source_activation=source_transcoder_activations[self.hookpoints_mlp[i]],
-                location=transcoder_locations[self.hookpoints_mlp[i]],
+                activation=target_activation,
+                source_activation=source_activation,
+                location=indices,
                 error=errors[self.hookpoints_mlp[i]],
                 source_error=errors[self.hookpoints_mlp[i]],
             )
@@ -395,63 +422,34 @@ class TranscodedModel(object):
 
     @torch.no_grad()
     @torch.autocast("cuda")
-    def w_dec(self, layer_idx: int, target_layer_idx: int | None = None) -> Float[Array, "features hidden_size"]:
-        try:
-            if target_layer_idx != layer_idx:
-                raise AttributeError
-            return self.transcoders[self.hookpoints_mlp[layer_idx]].W_dec
-        except AttributeError:
-            if target_layer_idx is None:
-                logger.warning("Summing decoder weights because target_layer_idx is None")
-                target_layer_idx = layer_idx
-                weight_combined = torch.zeros((self.w_dec(layer_idx, layer_idx).shape[0], self.hidden_size,), device=self.device, dtype=torch.float32)
-                for target_layer_idx in range(layer_idx, self.num_layers):
-                    try:
-                        weight_combined += self.w_dec(layer_idx, target_layer_idx)
-                    except IndexError:
-                        break
-                # weights_at_layers = {}
-                # while target_layer_idx < self.num_layers:
-                #     weights_at_layers[target_layer_idx] = weight_combined
-                #     for layer_from, weight_at in weights_at_layers.items():
-                #         try:
-                #             weight_combined += weight_at @ self.w_skip(layer_from, target_layer_idx).T
-                #         except IndexError:
-                #             pass
-                #     try:
-                #         weight_combined += self.w_dec(layer_idx, target_layer_idx)
-                #     except IndexError:
-                #         pass
-                #     target_layer_idx += 1
-                return weight_combined
-            # assume the target layer is contiguous
-            assert target_layer_idx >= layer_idx
-            try:
-                return self.transcoders[self.hookpoints_mlp[layer_idx]].W_decs[target_layer_idx - layer_idx]
-            except AttributeError:
-                raise IndexError
+    def w_dec(
+        self, layer_idx: int, target_layer_idx: int | None = None
+    ) -> Float[Array, "features hidden_size"]:
+        if target_layer_idx is None:
+            logger.warning("Summing decoder weights because target_layer_idx is None")
+            target_layer_idx = layer_idx
+            weight_combined = torch.zeros(
+                (
+                    self.w_dec(layer_idx, layer_idx).shape[0],
+                    self.hidden_size,
+                ),
+                device=self.device,
+                dtype=torch.float32,
+            )
+            for target_layer_idx in range(layer_idx, self.num_layers):
+                weight_combined += self.w_dec(layer_idx, target_layer_idx)
+            return weight_combined
+        assert target_layer_idx >= layer_idx
+        decoder = self.clt.decoders[f"{layer_idx}->{target_layer_idx}"]
+        return decoder.weight
 
-    def w_skip(self, layer_idx: int, target_layer_idx: int | None = None) -> Float[Array, "hidden_size hidden_size"]:
-        transcoder = self.transcoders[self.hookpoints_mlp[layer_idx]]
-        try:
-            transcoder.W_skip
-        except AttributeError:
-            assert target_layer_idx is not None, "target_layer_idx must be provided for multi-target transcoders"
-            assert target_layer_idx >= layer_idx
-            try:
-                w_skip = transcoder.W_skips[target_layer_idx - layer_idx]
-            except AttributeError:
-                raise IndexError
-            if w_skip is None:
-                raise IndexError
-            return w_skip
-        else:
-            if target_layer_idx != layer_idx:
-                raise IndexError
-            return transcoder.W_skip
+    def w_skip(
+        self, layer_idx: int, target_layer_idx: int | None = None
+    ) -> Float[Array, "hidden_size hidden_size"]:
+        raise NotImplementedError()
 
     def w_enc(self, layer_idx: int) -> Float[Array, "features hidden_size"]:
-        return self.transcoders[self.hookpoints_mlp[layer_idx]].encoder.weight
+        return self.clt.encoders[layer_idx].weight
 
     def attn(self, layer_idx: int) -> torch.nn.Module:
         layer = self.model.get_submodule(self.layer_prefix)[layer_idx]
@@ -464,7 +462,9 @@ class TranscodedModel(object):
         else:
             raise ValueError(f"Unsupported model type: {type(self.model)}")
 
-    def attn_output(self, layer_idx: int) -> Float[Array, "hidden_size num_attention_heads head_dim"]:
+    def attn_output(
+        self, layer_idx: int
+    ) -> Float[Array, "hidden_size num_attention_heads head_dim"]:
         if isinstance(self.model, LlamaPreTrainedModel):
             w_o = self.attn(layer_idx).o_proj.weight
         elif isinstance(self.model, GPTNeoPreTrainedModel):
@@ -475,16 +475,22 @@ class TranscodedModel(object):
             raise ValueError(f"Unsupported model type: {type(self.model)}")
         return w_o.reshape(self.hidden_size, self.num_attention_heads, self.head_dim)
 
-    def attn_value(self, layer_idx: int) -> Float[Array, "num_attention_heads head_dim hidden_size"]:
+    def attn_value(
+        self, layer_idx: int
+    ) -> Float[Array, "num_attention_heads head_dim hidden_size"]:
         if not isinstance(self.model, GPT2PreTrainedModel):
             w_v = self.attn(layer_idx).v_proj.weight
         else:
-            w_q, w_k, w_v = torch.split(self.attn(layer_idx).c_attn.weight, self.hidden_size, dim=1)
+            w_q, w_k, w_v = torch.split(
+                self.attn(layer_idx).c_attn.weight, self.hidden_size, dim=1
+            )
             w_v = w_v.T
         w_v = torch.repeat_interleave(w_v, self.repeat_kv, dim=0)
         return w_v.reshape(self.num_attention_heads, self.head_dim, self.hidden_size)
 
-    def project_v(self, layer_idx: int, layer_normed: Float[Array, "batch seq_len hidden_size"]) -> Float[Array, "batch seq_len num_attention_heads head_dim"]:
+    def project_v(
+        self, layer_idx: int, layer_normed: Float[Array, "batch seq_len hidden_size"]
+    ) -> Float[Array, "batch seq_len num_attention_heads head_dim"]:
         if not isinstance(self.model, GPT2PreTrainedModel):
             return self.attn(layer_idx).v_proj(layer_normed)
         else:
@@ -505,25 +511,31 @@ class TranscodedModel(object):
             impl_name = f"eager_{type(attn).__name__}"
         no_grad_name = "no_grad_" + impl_name
         if no_grad_name not in ALL_ATTENTION_FUNCTIONS:
+
             @torch.compile
-            def new_attention_forward(module, query, key, value, attention_mask, *, impl_fn, **kwargs):
+            def new_attention_forward(
+                module, query, key, value, attention_mask, *, impl_fn, **kwargs
+            ):
                 query = query.detach()
                 key = key.detach()
-                _, attn_weights = impl_fn(module, query, key, value, attention_mask, **kwargs)
+                _, attn_weights = impl_fn(
+                    module, query, key, value, attention_mask, **kwargs
+                )
                 attn_weights = attn_weights.detach()
 
                 attn_output = torch.matmul(attn_weights, value)
                 attn_output = attn_output.transpose(1, 2)
 
                 return attn_output, attn_weights
+
             if isinstance(self.model, GPT2PreTrainedModel):
                 eager_attention_forward = gpt2_eager_attention_forward
             else:
                 raise ValueError(f"Unsupported model type: {type(self.model)}")
             ALL_ATTENTION_FUNCTIONS[no_grad_name] = partial(
                 new_attention_forward,
-                impl_fn=
-                ALL_ATTENTION_FUNCTIONS[original_implementation]
+                impl_fn=ALL_ATTENTION_FUNCTIONS[original_implementation]
                 if original_implementation != "eager"
-                else eager_attention_forward)
+                else eager_attention_forward,
+            )
         attn.config._attn_implementation = no_grad_name
