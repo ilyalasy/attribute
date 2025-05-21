@@ -18,6 +18,9 @@ from transformers.models.gpt2.modeling_gpt2 import (
     eager_attention_forward as gpt2_eager_attention_forward,
 )
 from transformers.models.gpt_neo import GPTNeoPreTrainedModel
+from transformers.models.gpt_neo.modeling_gpt_neo import (
+    GPTNeoSelfAttention,
+)
 from transformers.models.llama import LlamaPreTrainedModel
 
 from .utils import repeat_kv
@@ -113,8 +116,8 @@ class TranscodedModel(object):
         clt_config = CLTConfig(**config_dict)
 
         # Create and load model
-        clt = CrossLayerTranscoder(clt_config, process_group=None, device=device)
-        clt.load_state_dict(torch.load(clt_ckpt_path, map_location=device))
+        self.clt = CrossLayerTranscoder(clt_config, process_group=None, device=device)
+        self.clt.load_state_dict(torch.load(clt_ckpt_path, map_location=device))
 
         self.hookpoints_layer = [
             f"{self.layer_prefix}.{i}" for i in range(self.num_layers)
@@ -222,17 +225,22 @@ class TranscodedModel(object):
             )
 
         errors = {}
-        activations = {}
-        reconstructions = {}
+        source_activations = {}
+        target_activations = {}
 
         def get_mlp_hook(module, input, output):
             if isinstance(input, tuple):
                 input = input[0]
-
+            batch_dims = input.shape[:-1]
             module_name = self.module_to_name[module]
 
             layer_idx = self.name_to_index[module_name]
             latent_acts = self.clt.encode(input, layer_idx)
+
+            target_latent_acts = latent_acts.clone().unflatten(0, batch_dims)
+            source_latent_acts = latent_acts.unflatten(0, batch_dims).clone()
+            source_latent_acts.detach_()
+            source_latent_acts.requires_grad_(True)
 
             masked_features = mask_features.get(layer_idx, [])
             if masked_features:
@@ -241,16 +249,18 @@ class TranscodedModel(object):
                 mask[masked_features] = 0
                 latent_acts = latent_acts * mask.float()
 
-            activations[layer_idx] = latent_acts
+            source_activations[layer_idx] = source_latent_acts
+            target_activations[layer_idx] = target_latent_acts
 
             relevant_activations = {
-                k: v for k, v in activations.items() if k <= layer_idx and v.numel() > 0
+                k: v.flatten(0, -2)
+                for k, v in source_activations.items()
+                if k <= layer_idx and v.numel() > 0
             }
-            reconstructions[layer_idx] = self.clt.decode(
-                relevant_activations, layer_idx
-            )
+            transcoder_out = self.clt.decode(relevant_activations, layer_idx)
+            transcoder_out = transcoder_out.view(output.shape)
 
-            diff = output - reconstructions[layer_idx]
+            diff = output - transcoder_out
             if no_error:
                 error = torch.zeros_like(output)
             elif errors_from is None:
@@ -263,7 +273,7 @@ class TranscodedModel(object):
             error.requires_grad_(True)
             logger.info(f"Layer {module_name} error: {diff.norm() / output.norm()}")
 
-            result = (reconstructions[layer_idx] + error).to(output)
+            result = (transcoder_out + error).to(output)
             errors[module_name] = error
             return result
 
@@ -293,17 +303,13 @@ class TranscodedModel(object):
         if last_layer_activations.requires_grad:
             last_layer_activations.retain_grad()
 
+        k = self.clt.config.batchtopk_k or self.clt.config.topk_k
         mlp_outputs = {}
         for i in range(self.num_layers):
-            source_activation = activations[i].clone()
-            indices = source_activation.nonzero()
-            source_activation = source_activation[indices]
-            source_activation.detach_()
-            source_activation.requires_grad_(True)
-
-            target_activation = activations[i].clone()
-            indices = target_activation.nonzero()
-            target_activation = target_activation[indices]
+            source_activation = source_activations[i]
+            source_activation, indices = source_activation.topk(k, dim=-1)
+            target_activation = target_activations[i]
+            target_activation, _ = target_activation.topk(k, dim=-1)
 
             mlp_outputs[i] = MLPOutputs(
                 ln_factor=second_ln[self.hookpoints_ln[i]],
@@ -528,14 +534,59 @@ class TranscodedModel(object):
 
                 return attn_output, attn_weights
 
+            def neo_attn_wrapper(
+                self, query, key, value, attention_mask=None, head_mask=None
+            ):
+                # Keep the attention weights computation in fp32 to avoid overflow issues
+                query = query.to(torch.float32)
+                key = key.to(torch.float32)
+
+                attn_weights = torch.matmul(query, key.transpose(-1, -2))
+
+                # Apply sliding window masking for local attention layers
+                query_length, key_length = query.size(-2), key.size(-2)
+                causal_mask = self.bias[
+                    :, :, key_length - query_length : key_length, :key_length
+                ]
+                mask_value = torch.finfo(attn_weights.dtype).min
+                # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
+                # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
+                mask_value = torch.tensor(
+                    mask_value, dtype=attn_weights.dtype, device=attn_weights.device
+                )
+                attn_weights = torch.where(causal_mask, attn_weights, mask_value)
+
+                if attention_mask is not None:  # no matter the length, we just slice it
+                    causal_mask = attention_mask[:, :, :, : key.shape[-2]]
+                    attn_weights = attn_weights + causal_mask
+
+                attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
+                attn_weights = attn_weights.to(value.dtype)
+                attn_weights = self.attn_dropout(attn_weights)
+
+                # Mask heads if we want to
+                if head_mask is not None:
+                    attn_weights = attn_weights * head_mask
+
+                # freeze QK
+                attn_weights = attn_weights.detach()
+
+                attn_output = torch.matmul(attn_weights, value)
+
+                return attn_output, attn_weights
+
             if isinstance(self.model, GPT2PreTrainedModel):
                 eager_attention_forward = gpt2_eager_attention_forward
+                ALL_ATTENTION_FUNCTIONS[no_grad_name] = partial(
+                    new_attention_forward,
+                    impl_fn=ALL_ATTENTION_FUNCTIONS[original_implementation]
+                    if eager_attention_forward is None
+                    or original_implementation != "eager"
+                    else eager_attention_forward,
+                )
+            elif isinstance(self.model, GPTNeoPreTrainedModel):
+                GPTNeoSelfAttention._attn = neo_attn_wrapper
             else:
                 raise ValueError(f"Unsupported model type: {type(self.model)}")
-            ALL_ATTENTION_FUNCTIONS[no_grad_name] = partial(
-                new_attention_forward,
-                impl_fn=ALL_ATTENTION_FUNCTIONS[original_implementation]
-                if original_implementation != "eager"
-                else eager_attention_forward,
-            )
+
         attn.config._attn_implementation = no_grad_name
