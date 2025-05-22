@@ -1,9 +1,11 @@
 import asyncio
+import os
 from pathlib import Path
 from typing import Callable
 
 import torch
 from simple_parsing import ArgumentParser
+from huggingface_hub import snapshot_download
 from transformers import (
     AutoModel,
     AutoTokenizer,
@@ -40,6 +42,7 @@ def load_artifacts(run_cfg: RunConfig):
         torch_dtype=dtype,
         token=run_cfg.hf_token,
     )
+    model.to("cuda")
     hookpoint_to_sparse_encode, transcode = load_hooks_sparse_coders(
         model,
         run_cfg,
@@ -145,6 +148,8 @@ async def run(
 
     latents_path = base_path / "latents"
 
+    if not os.path.exists(run_cfg.sparse_model):
+        run_cfg.sparse_model = snapshot_download(run_cfg.sparse_model)
     hookpoints, hookpoint_to_sparse_encode, model, transcode = load_artifacts(run_cfg)
     tokenizer = AutoTokenizer.from_pretrained(run_cfg.model, token=run_cfg.hf_token)
 
@@ -155,14 +160,15 @@ async def run(
         ),
     )
     if nrh:
-        populate_cache(
-            run_cfg,
-            model,
-            nrh,
-            latents_path,
-            tokenizer,
-            transcode,
-        )
+        with torch.autocast("cuda"), torch.inference_mode():
+            populate_cache(
+                run_cfg,
+                model,
+                nrh,
+                latents_path,
+                tokenizer,
+                transcode,
+            )
 
 
 if __name__ == "__main__":

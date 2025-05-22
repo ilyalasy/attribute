@@ -11,7 +11,6 @@ import torch
 from delphi.config import ConstructorConfig, SamplerConfig
 from delphi.latents import LatentDataset
 from loguru import logger
-from natsort import natsorted
 from tqdm.auto import tqdm, trange
 
 from .caching import TranscodedModel, TranscodedOutputs
@@ -28,20 +27,23 @@ class AttributionConfig:
     scan: str
 
     # how many target nodes to compute contributions for
-    flow_steps: int = 2000
+    flow_steps: int = 500
     # whether to use the softmax gradient for the output node
     # instead of the logit
     softmax_grad_type: Literal["softmax", "mean", "straight"] = "mean"
 
+    # remove features that are this dense
+    filter_high_freq_early: float = 0.01
+
     # remove MLP edges below this threshold
-    pre_filter_threshold: float = 1e-4
+    pre_filter_threshold: float = 1e-3
     # keep edges above this threshold
-    edge_threshold = 1e-4
+    edge_threshold = 1e-3
     # keep top k edges for each node
     top_k_edges: int = 128
 
     # always keep nodes above this threshold of influence
-    node_threshold = 1e-3
+    node_threshold = 5e-4
     # keep per_layer_position nodes above this threshold for each layer/position pair
     secondary_threshold = 1e-5
     per_layer_position = 0
@@ -88,7 +90,7 @@ class AttributionGraph:
     def logits(self):
         return self.cache.logits[0]
 
-    def adjacency_matrix(self, normalize: bool = True, absolute: bool = True, use_activation: bool = True):
+    def adjacency_matrix(self, normalize: bool = True, absolute: bool = True):
         logger.info("Deduplicating nodes")
         dedup_node_names = set()
         for edge in self.edges.values():
@@ -106,8 +108,6 @@ class AttributionGraph:
             target_index = dedup_node_indices[edge.target.id]
             source_index = dedup_node_indices[edge.source.id]
             weight = edge.weight
-            if not use_activation and isinstance(edge.source, IntermediateNode):
-                weight /= edge.source.activation
             if absolute:
                 weight = abs(weight)
             adj_matrix[target_index, source_index] = weight
@@ -116,12 +116,20 @@ class AttributionGraph:
 
         return adj_matrix, dedup_node_names
 
+    def make_latent_dataset(self, cache_path: os.PathLike, module_latents: dict[str, torch.Tensor]):
+        return LatentDataset(
+            cache_path,
+            SamplerConfig(n_examples_train=10, train_type="top", n_examples_test=0),
+            ConstructorConfig(center_examples=False, example_ctx_len=16, n_non_activating=0),
+            modules=list(module_latents.keys()) if module_latents else None,
+            latents=module_latents,
+        )
 
     def save_graph(self, save_dir: os.PathLike):
         save_dir = Path(save_dir)
         logger.info("Saving graph to", save_dir)
 
-        adj_matrix, dedup_node_names = self.adjacency_matrix()
+        adj_matrix, dedup_node_names = self.adjacency_matrix(absolute=True, normalize=True)
         dedup_node_indices = {name: i for i, name in enumerate(dedup_node_names)}
 
         n_initial = len(dedup_node_names)
@@ -151,9 +159,9 @@ class AttributionGraph:
         else:
             influence = self.influence
 
-        influence = influence * activation_sources
+        influence = np.abs(influence) * activation_sources
         influence = influence / np.maximum(1e-2, influence.sum(axis=1, keepdims=True))
-        adj_matrix = adj_matrix * activation_sources
+        adj_matrix = np.abs(adj_matrix) * activation_sources
         adj_matrix = adj_matrix / np.maximum(1e-2, adj_matrix.sum(axis=1, keepdims=True))
 
         total_error_influence = 1 - (influence_sources @ adj_matrix) @ error_mask
@@ -270,6 +278,7 @@ class AttributionGraph:
         )
 
         graph_data_dir = save_dir / "graph_data"
+        graph_data_dir.mkdir(parents=True, exist_ok=True)
         circuit_path = graph_data_dir / f"{self.config.name}.json"
         open(circuit_path, "w").write(json.dumps(result))
 
@@ -281,7 +290,43 @@ class AttributionGraph:
             if save_file.stem == self.config.name:
                 own_file_index = i
         metadatas[0], metadatas[own_file_index] = metadatas[own_file_index], metadatas[0]
+        (save_dir / "data").mkdir(parents=True, exist_ok=True)
         open(save_dir / "data/graph-metadata.json", "w").write(json.dumps(dict(graphs=metadatas)))
+
+    def get_dense_features(self, cache_path: os.PathLike):
+        cache_path = Path(cache_path)
+        dense_features = set()
+        if not cache_path.exists() or not self.config.filter_high_freq_early:
+            logger.warning("Skipping dead feature detection because cache does not exist or filter_high_freq_early is 0")
+            self.dense_features = dense_features
+            return
+        dense_cache_path = cache_path.parent / "dense_features.json"
+        if dense_cache_path.exists():
+            dense = json.loads(dense_cache_path.read_text())
+        else:
+            dense = []
+            ds = self.make_latent_dataset(cache_path, None)
+            for buf in tqdm(ds.buffers, desc="Finding dense features"):
+                module = buf.module_path
+                all_features, _, all_tokens = buf.load()
+                all_features = all_features[..., 2]
+
+                # unique, counts = torch.unique(all_features, return_counts=True)
+                # freqs = counts / all_tokens.numel()
+                # too_high = freqs > self.config.filter_high_freq_early
+
+                all_tokens, all_features = all_tokens.numpy(), all_features.numpy()
+                unique, counts = np.unique(all_features, return_counts=True)
+                freqs = counts / all_tokens.size
+                too_high = freqs > self.config.filter_high_freq_early
+
+                # dead_features[module].extend(unique[too_high].tolist())
+                layer_idx = self.model.temp_hookpoints_mlp.index(module)
+                feature_names = [f"{layer_idx}_{feature}" for feature in unique[too_high].tolist()]
+                dense.extend(feature_names)
+            open(dense_cache_path, "w").write(json.dumps(dense))
+
+        self.dense_features = set(f"intermediate_{pos}_{feature}" for pos in range(self.seq_len) for feature in dense)
 
     async def cache_features(self, cache_path: os.PathLike, save_dir: os.PathLike):
         module_latents = defaultdict(list)
@@ -292,14 +337,9 @@ class AttributionGraph:
                 dead_features.add((layer, feature))
                 module_latents[self.model.temp_hookpoints_mlp[layer]].append(feature)
         module_latents = {k: torch.tensor(v) for k, v in module_latents.items()}
+        module_latents = {k: v[torch.argsort(v)] for k, v in module_latents.items()}
 
-        ds = LatentDataset(
-            cache_path,
-            SamplerConfig(n_examples_train=10, train_type="top", n_examples_test=0),
-            ConstructorConfig(center_examples=False),
-            modules=natsorted(module_latents.keys()),
-            latents=module_latents,
-        )
+        ds = self.make_latent_dataset(cache_path, module_latents)
 
         logit_weight = self.model.logit_weight
         logit_bias = self.model.logit_bias
@@ -481,6 +521,8 @@ class AttributionGraph:
         self.queue = NodeQueue()
         self.remaining_output_nodes = output_nodes.copy()
 
+        self.dead_features = set()
+
     @torch.autocast("cuda")
     def flow_once(self):
         with measure_time(
@@ -559,14 +601,19 @@ class AttributionGraph:
 
             mlp_grad = gradients[mlp_index]
             mlp_grad = mlp_grad[:, -true_seq_len:]
-            mlp_grad_values, mlp_grad_indices = mlp_grad.flatten().topk(self.config.top_k_edges)
+            edges = (mlp_grad * (mlp_grad.abs() > self.config.pre_filter_threshold)).abs().flatten()
+            _, mlp_grad_indices = edges.topk(min(self.config.top_k_edges, edges.shape[0]))
             mlp_feature_indices = self.cache.mlp_outputs[layer_idx].location[:, -true_seq_len:].flatten()[mlp_grad_indices]
-            for grad_val, grad_idx, feature_idx in zip(mlp_grad_values.tolist(), mlp_grad_indices.tolist(), mlp_feature_indices.tolist()):
+            mlp_grad_values = mlp_grad.flatten()[mlp_grad_indices]
+            for grad_val, grad_idx, feature_idx in zip(mlp_grad_values, mlp_grad_indices.tolist(), mlp_feature_indices.tolist()):
                 seq_idx = int(grad_idx // mlp_grad.shape[-1])
+                node_name = f"intermediate_{seq_idx}_{layer_idx}_{feature_idx}"
+                if node_name in self.dense_features:
+                    continue
                 all_contributions.append(Contribution(
-                    source=self.nodes[f"intermediate_{seq_idx}_{layer_idx}_{feature_idx}"],
+                    source=self.nodes[node_name],
                     target=target_node,
-                    contribution=grad_val,
+                    contribution=grad_val.cpu(),
                 ))
 
         with measure_time(

@@ -1,7 +1,13 @@
 #!/bin/sh
-export CUDA_VISIBLE_DEVICES=6
-set -e
-uv run python evaluate.py --transcoder_path ../e2e/checkpoints/gelu-4l-clt/ef128k64
+# set -e
+uv run python evaluate.py --model gpt2 --transcoder_path ../e2e/checkpoints/clt-gpt2/coal-per-k8
+uv run python evaluate.py --model gpt2 --transcoder_path ../e2e/checkpoints/clt-gpt2/const-k8
+uv run python evaluate.py --model gpt2 --transcoder_path ../e2e/checkpoints/clt-gpt2/no-clt
+uv run python evaluate.py --model gpt2 --transcoder_path ../e2e/checkpoints/clt-gpt2/coal
+uv run python evaluate.py --model gpt2 --transcoder_path ../sparsify/checkpoints/clt-gpt2/new-run
+
+
+# uv run python evaluate.py --transcoder_path ../e2e/checkpoints/gelu-4l-clt/ef128k64
 # uv run python evaluate.py --transcoder_path ../e2e/checkpoints/gelu-4l-clt/ef128k64_
 # uv run python evaluate.py --transcoder_path ../e2e/checkpoints/gelu-4l-clt/k64
 # uv run python evaluate.py --transcoder_path ../e2e/checkpoints/gelu-4l-nonclt/baseline

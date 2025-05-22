@@ -1,4 +1,30 @@
 #!/usr/bin/env bash
+# PROMPT_NAME="ndag-gpt2"
+# PROMPT_TEXT="<|endoftext|>The National Digital Analytics Group ("
+PROMPT_NAME="basketball-llama"
+set -e
+PROMPT_TEXT="Michael Jordan plays the sport of"
+uv run python -m attribute --model_name="meta-llama/Llama-3.2-1B" \
+--transcoder_path="EleutherAI/skip-transcoder-Llama-3.2-1B-131k" \
+--cache_path=results/transcoder_llama_131k/latents \
+--name $PROMPT_NAME \
+--scan "transcoder_llama_131k" \
+"$PROMPT_TEXT" \
+--remove_prefix 1
+exit
+
+
+PROMPT_NAME="basketball-gpt2"
+PROMPT_TEXT="<|endoftext|>Michael Jordan plays the sport of"
+uv run python -m attribute --model_name="gpt2" \
+--transcoder_path="/mnt/ssd-1/nev/sparsify/checkpoints/clt-gpt2/const-k16" \
+--cache_path=results/transcoder_gpt2_128x_const_k16_v0/latents \
+--name $PROMPT_NAME \
+--scan "gpt2-128x-const-k16-v0" \
+--remove_prefix 2 \
+"$PROMPT_TEXT"
+exit
+
 uv run python -m attribute --model_name="nev/GELU_4L512W_C4_Code" \
 --transcoder_path="../e2e/checkpoints/gelu-4l-clt/ef128k64" \
 --cache_path=results/transcoder_gelu4l_x128k64-0/latents \

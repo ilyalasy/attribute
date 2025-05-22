@@ -1,6 +1,7 @@
 # Evaluation script for measuring model performance on next token prediction
 # Calculates token-level accuracy and KL divergence between predicted and true distributions
 import argparse
+import itertools
 import json
 from collections import OrderedDict
 from datetime import datetime
@@ -102,7 +103,10 @@ def main():
 
     # Evaluate on full dataset
     try:
-        for batch in (bar := tqdm(dataloader, desc="Evaluating")):
+        if args.max_steps is not None:
+            dataloader = itertools.islice(dataloader, args.max_steps)
+        bar = tqdm(dataloader, desc="Evaluating", total=args.max_steps)
+        for batch in bar:
             input_ids = batch["input_ids"].to(model.device)
             with torch.no_grad():
                 out_base = model.model(input_ids)

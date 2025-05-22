@@ -1,18 +1,27 @@
 #!/usr/bin/env bash
 # MODEL=roneneldan/TinyStories-33M
 # MODEL=nev/acronym-toy-3M
-MODEL=nev/GELU_4L512W_C4_Code
+# MODEL=nev/GELU_4L512W_C4_Code
+# MODEL=gpt2
+MODEL=meta-llama/Llama-3.2-1B
 # TRANSCODER=../e2e/checkpoints/clt-ts/ts
 # TRANSCODER=../e2e/checkpoints/acr-clt/test
 # TRANSCODER=../e2e/checkpoints/gelu-4l-clt/k64
 # TRANSCODER=../e2e/checkpoints/gelu-4l-clt/ef64k64
 # TRANSCODER=../e2e/checkpoints/gelu-4l-nonclt-skip/ef64k64
-TRANSCODER=../e2e/checkpoints/gelu-4l-clt/ef128k64
+# TRANSCODER=../e2e/checkpoints/gelu-4l-clt/ef128k64
+# TRANSCODER=../e2e/checkpoints/clt-gpt2/coal-per-k8
+# TRANSCODER=../sparsify/checkpoints/clt-gpt2/const-k16
+TRANSCODER=EleutherAI/skip-transcoder-Llama-3.2-1B-131k
 # DATASET="--dataset_repo roneneldan/TinyStories --dataset_split train --n_tokens 10_000_000"
 # DATASET="--dataset_repo nev/acronyms-toy-dataset --dataset_split train --n_tokens 10_000_000"
 DATASET="--dataset_repo EleutherAI/fineweb-edu-dedup-10b --dataset_split train --n_tokens 10_000_000"
 # NAME="transcoder_128x"
 # NAME="transcoder_acr"
-NAME="transcoder_gelu4l_x128k64-0"
+# NAME="transcoder_gelu4l_x128k64-0"
+# NAME="transcoder_gpt2_128x_coal_per_k8_v0"
+# NAME="transcoder_gpt2_128x_const_k16_v0"
+NAME="transcoder_llama_131k"
 # CUDA_VISIBLE_DEVICES=1 python cache.py $MODEL $TRANSCODER --num_gpus 1 $DATASET --hookpoints h.0.mlp h.1.mlp h.2.mlp h.3.mlp h.4.mlp h.5.mlp h.6.mlp h.7.mlp --name $NAME
-CUDA_VISIBLE_DEVICES=0 python cache.py $MODEL $TRANSCODER --num_gpus 1 $DATASET --hookpoints h.0.mlp h.1.mlp h.2.mlp h.3.mlp --name $NAME
+# uv run python cache.py $MODEL $TRANSCODER --num_gpus 1 $DATASET --hookpoints h.0.mlp h.1.mlp h.2.mlp h.3.mlp --name $NAME
+uv run python cache.py $MODEL $TRANSCODER --num_gpus 1 $DATASET --hookpoints layers.0.mlp layers.1.mlp layers.2.mlp layers.3.mlp layers.4.mlp layers.5.mlp layers.6.mlp layers.7.mlp layers.8.mlp layers.9.mlp layers.10.mlp layers.11.mlp layers.12.mlp layers.13.mlp layers.14.mlp layers.15.mlp --name $NAME --batch_size 16

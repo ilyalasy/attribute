@@ -16,7 +16,7 @@ async def main(
     cache_path = "/mnt/ssd-1/gpaulo/smollm-decomposition/attribution_graph/results/transcoder_128x/latents",
     name = "test-1-ts",
     scan = "default",
-    remove_bos = False,
+    remove_prefix = 0,
 ):
     logger.remove()
     logger.add(sys.stderr, level="INFO")
@@ -32,22 +32,20 @@ async def main(
     )
     transcoded_outputs = model(prompt)
 
-    if remove_bos:
-        transcoded_outputs.input_ids = transcoded_outputs.input_ids[:, 1:]
+    if remove_prefix > 0:
+        transcoded_outputs.input_ids = transcoded_outputs.input_ids[:, remove_prefix:]
         # only ever accessed w/ [-1], removing BOS doesn't matter
         # transcoded_outputs.last_layer_activations = transcoded_outputs.last_layer_activations[:, 1:]
-        transcoded_outputs.logits = transcoded_outputs.logits[:, 1:]
+        transcoded_outputs.logits = transcoded_outputs.logits[:, remove_prefix:]
         for k, mlp_output in transcoded_outputs.mlp_outputs.items():
-            mlp_output.ln_factor = mlp_output.ln_factor[:, 1:]
-            mlp_output.activation = mlp_output.activation[:, 1:]
-            mlp_output.location = mlp_output.location[:, 1:]
-            mlp_output.error = mlp_output.error[:, 1:]
-        for k, attn_output in transcoded_outputs.attn_outputs.items():
-            attn_output.ln_factor = attn_output.ln_factor[:, 1:]
-            attn_output.attn_values = attn_output.attn_values[:, :, 1:]
-            attn_output.attn_patterns = attn_output.attn_patterns[:, :, 1:, 1:]
+            mlp_output.ln_factor = mlp_output.ln_factor[:, remove_prefix:]
+            mlp_output.activation = mlp_output.activation[:, remove_prefix:]
+            mlp_output.location = mlp_output.location[:, remove_prefix:]
+            mlp_output.error = mlp_output.error[:, remove_prefix:]
+            # we don't remove BOS from source nodes because we take gradients to them
 
     attribution_graph = AttributionGraph(model, transcoded_outputs, config)
+    attribution_graph.get_dense_features(cache_path)
     attribution_graph.flow()
     attribution_graph.save_graph(save_dir)
     await attribution_graph.cache_features(cache_path, save_dir)

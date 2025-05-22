@@ -22,9 +22,9 @@ from transformers.models.gpt_neo.modeling_gpt_neo import (
     GPTNeoSelfAttention,
 )
 from transformers.models.llama import LlamaPreTrainedModel
+from transformers.models.qwen2 import Qwen2PreTrainedModel
 
-from .utils import repeat_kv
-
+LlamaLike = LlamaPreTrainedModel | Qwen2PreTrainedModel
 GPT2Like = GPT2PreTrainedModel | GPTNeoPreTrainedModel
 
 
@@ -36,20 +36,13 @@ class MLPOutputs:
     location: Int[Array, "batch seq_len k"]
     error: Float[Array, "batch seq_len hidden_size"]
     source_error: Float[Array, "batch seq_len hidden_size"]
-
-
-@dataclass
-class AttentionOutputs:
-    ln_factor: Float[Array, "batch seq_len hidden_size"]
-    attn_values: Float[Array, "batch num_attention_heads seq_len head_dim"]
-    attn_patterns: Float[Array, "batch num_attention_heads seq_len seq_len"]
+    l0: float
 
 
 @dataclass
 class TranscodedOutputs:
     input_ids: Int[Array, "batch seq_len"]
     mlp_outputs: dict[int, MLPOutputs]
-    attn_outputs: dict[int, AttentionOutputs]
     last_layer_activations: Float[Array, "batch seq_len hidden_size"]
     first_layer_activations: Float[Array, "batch seq_len hidden_size"]
     logits: Float[Array, "batch seq_len vocab_size"]
@@ -64,6 +57,7 @@ class TranscodedOutputs:
 
 
 class TranscodedModel(object):
+    @torch.no_grad()
     def __init__(
         self,
         model_name: str | os.PathLike,
@@ -77,8 +71,8 @@ class TranscodedModel(object):
             model_name,
             device_map={"": device},
             torch_dtype=torch.bfloat16,
-            attn_implementation="eager",
         )
+        model.to(device)
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = model
         self.tokenizer = tokenizer
@@ -88,7 +82,7 @@ class TranscodedModel(object):
         if hookpoint_fn is None:
 
             def hookpoint_fn(hookpoint):
-                if isinstance(model, LlamaPreTrainedModel):
+                if isinstance(model, LlamaLike):
                     return hookpoint.replace("model.layers.", "layers.")
                 elif isinstance(model, GPT2Like):
                     return hookpoint.replace("transformer.h.", "h.")
@@ -165,6 +159,7 @@ class TranscodedModel(object):
         self,
         prompt: str | torch.Tensor,
         mask_features: dict[int, list[int]] = {},
+        steer_features: dict[int, list[(int, int, float)]] = {},
         errors_from: TranscodedOutputs | None = None,
         no_error: bool = False,
     ) -> TranscodedOutputs:
@@ -181,41 +176,19 @@ class TranscodedModel(object):
             raise ValueError(f"Unsupported prompt type: {type(prompt)}")
         self.clear_hooks()
 
-        attn_values = {}
-        first_ln = {}
-
-        def ln_record_hook(module, input, output, save_dict):
+        def ln_record_hook(module, input, output, save_dict=None):
             mean = input[0].mean(dim=-1, keepdim=True).detach()
             var = input[0].var(dim=-1, keepdim=True)
-            multiplier = (1 / torch.sqrt(var + module.eps).detach()) * module.weight
-            save_dict[self.module_to_name[module]] = multiplier
-            return (input[0] - mean) * multiplier + module.bias
-
-        def get_attention_values_hook(module, input, output):
-            # this hook is in the layer
-            residual = input[0]
-            layer_name = self.module_to_name[module]
-            layer_normed = getattr(module, self.attn_layernorm_name)(residual)
-
-            # stuff related to attention
-            input_shape = layer_normed.shape[:-1]
-            hidden_shape = (*input_shape, -1, self.head_dim)
-
-            layer_idx = self.name_to_index[layer_name]
-            value_states = (
-                self.project_v(layer_idx, layer_normed)
-                .view(hidden_shape)
-                .transpose(1, 2)
-            )
-            values = repeat_kv(value_states, self.repeat_kv)
-            attn_values[layer_name] = values
+            multiplier = (
+                1 / torch.sqrt(var + getattr(module, "eps", 1e-5)).detach()
+            ) * module.weight
+            if save_dict is not None:
+                save_dict[self.module_to_name[module]] = multiplier
+            return (input[0] - mean) * multiplier + getattr(module, "bias", 0)
 
         for hookpoint in self.hookpoints_layer:
-            self.name_to_module[hookpoint].register_forward_hook(
-                get_attention_values_hook
-            )
             ln = getattr(self.name_to_module[hookpoint], self.attn_layernorm_name)
-            ln.register_forward_hook(partial(ln_record_hook, save_dict=first_ln))
+            ln.register_forward_hook(ln_record_hook)
             self.freeze_attention_pattern(hookpoint)
 
         second_ln = {}
@@ -227,6 +200,7 @@ class TranscodedModel(object):
         errors = {}
         source_activations = {}
         target_activations = {}
+        l0s = {}
 
         def get_mlp_hook(module, input, output):
             if isinstance(input, tuple):
@@ -236,6 +210,9 @@ class TranscodedModel(object):
 
             layer_idx = self.name_to_index[module_name]
             latent_acts = self.clt.encode(input, layer_idx)
+
+            l0 = (latent_acts != 0).float().sum(dim=-1).mean().item()
+            l0s[module_name] = l0
 
             target_latent_acts = latent_acts.clone().unflatten(0, batch_dims)
             source_latent_acts = latent_acts.unflatten(0, batch_dims).clone()
@@ -283,12 +260,10 @@ class TranscodedModel(object):
         outputs = self.model(
             input_ids=tokenized_prompt.input_ids,
             #  attention_mask=tokenized_prompt.attention_mask,
-            output_attentions=True,
             output_hidden_states=True,
         )
         self.clear_hooks()
 
-        attention_patterns = outputs.attentions
         logits = outputs.logits
 
         logger.info("Top last token logits:")
@@ -318,19 +293,12 @@ class TranscodedModel(object):
                 location=indices,
                 error=errors[self.hookpoints_mlp[i]],
                 source_error=errors[self.hookpoints_mlp[i]],
-            )
-        attn_outputs = {}
-        for i in range(self.num_layers):
-            attn_outputs[i] = AttentionOutputs(
-                ln_factor=first_ln[self.hookpoints_attn_ln[i]],
-                attn_values=attn_values[self.hookpoints_layer[i]],
-                attn_patterns=attention_patterns[i],
+                l0=l0s[self.hookpoints_mlp[i]],
             )
 
         transcoded_outputs = TranscodedOutputs(
             input_ids=tokenized_prompt.input_ids,
             mlp_outputs=mlp_outputs,
-            attn_outputs=attn_outputs,
             first_layer_activations=first_layer_activations,
             last_layer_activations=last_layer_activations,
             logits=logits,
@@ -340,7 +308,7 @@ class TranscodedModel(object):
 
     @property
     def layer_prefix(self):
-        if isinstance(self.model, LlamaPreTrainedModel):
+        if isinstance(self.model, LlamaLike):
             return "model.layers"
         elif isinstance(self.model, GPT2Like):
             return "transformer.h"
@@ -349,7 +317,7 @@ class TranscodedModel(object):
 
     @property
     def attn_layernorm_name(self):
-        if isinstance(self.model, LlamaPreTrainedModel):
+        if isinstance(self.model, LlamaLike):
             return "input_layernorm"
         elif isinstance(self.model, GPT2Like):
             return "ln_1"
@@ -358,7 +326,7 @@ class TranscodedModel(object):
 
     @property
     def mlp_layernorm_name(self):
-        if isinstance(self.model, LlamaPreTrainedModel):
+        if isinstance(self.model, LlamaLike):
             return "post_attention_layernorm"
         elif isinstance(self.model, GPT2Like):
             return "ln_2"
@@ -374,7 +342,7 @@ class TranscodedModel(object):
 
     @property
     def embedding_weight(self):
-        if isinstance(self.model, LlamaPreTrainedModel):
+        if isinstance(self.model, LlamaLike):
             return self.model.model.embed_tokens.weight
         elif isinstance(self.model, GPT2Like):
             return self.model.transformer.wte.weight
@@ -387,7 +355,7 @@ class TranscodedModel(object):
 
     @property
     def final_ln(self):
-        if isinstance(self.model, LlamaPreTrainedModel):
+        if isinstance(self.model, LlamaLike):
             return self.model.model.norm
         elif isinstance(self.model, GPT2Like):
             return self.model.transformer.ln_f
@@ -396,7 +364,7 @@ class TranscodedModel(object):
 
     @property
     def logit_weight(self):
-        if isinstance(self.model, LlamaPreTrainedModel):
+        if isinstance(self.model, LlamaLike):
             return self.model.lm_head.weight * self.final_ln.weight
         elif isinstance(self.model, GPT2Like):
             return self.model.lm_head.weight * self.final_ln.weight
@@ -408,7 +376,9 @@ class TranscodedModel(object):
         bias = self.model.lm_head.bias
         if bias is None:
             bias = 0
-        return bias + self.logit_weight @ self.final_ln.bias
+        if hasattr(self.final_ln, "bias"):
+            bias = bias + self.logit_weight @ self.final_ln.bias
+        return bias
 
     @property
     def vocab_size(self):
@@ -459,7 +429,7 @@ class TranscodedModel(object):
 
     def attn(self, layer_idx: int) -> torch.nn.Module:
         layer = self.model.get_submodule(self.layer_prefix)[layer_idx]
-        if isinstance(self.model, LlamaPreTrainedModel):
+        if isinstance(self.model, LlamaLike):
             return layer.self_attn
         elif isinstance(self.model, GPTNeoPreTrainedModel):
             return layer.attn.attention
@@ -471,7 +441,7 @@ class TranscodedModel(object):
     def attn_output(
         self, layer_idx: int
     ) -> Float[Array, "hidden_size num_attention_heads head_dim"]:
-        if isinstance(self.model, LlamaPreTrainedModel):
+        if isinstance(self.model, LlamaLike):
             w_o = self.attn(layer_idx).o_proj.weight
         elif isinstance(self.model, GPTNeoPreTrainedModel):
             w_o = self.attn(layer_idx).out_proj.weight
@@ -504,89 +474,41 @@ class TranscodedModel(object):
             q, k, v = torch.split(projected, self.hidden_size, dim=-1)
             return v
 
+    def attn_q_slice(self, layer_idx: int):
+        if isinstance(self.model, GPT2PreTrainedModel):
+            return self.attn(layer_idx).c_attn, 0, self.hidden_size
+        elif isinstance(self.model, (GPTNeoPreTrainedModel, LlamaLike)):
+            return self.attn(layer_idx).q_proj, 0, self.hidden_size
+        else:
+            raise ValueError(f"Unsupported model type: {type(self.model)}")
+
+    def attn_k_slice(self, layer_idx: int):
+        if isinstance(self.model, GPT2PreTrainedModel):
+            return self.attn(layer_idx).c_attn, self.hidden_size, self.hidden_size * 2
+        elif isinstance(self.model, (GPTNeoPreTrainedModel, LlamaLike)):
+            return self.attn(layer_idx).k_proj, 0, self.hidden_size
+        else:
+            raise ValueError(f"Unsupported model type: {type(self.model)}")
+
     def decode_token(self, token_id: int) -> str:
         return self.tokenizer.decode([token_id])
 
     def freeze_attention_pattern(self, hookpoint: str):
-        attn = self.attn(self.name_to_index[hookpoint])
-        original_implementation = attn.config._attn_implementation
-        if original_implementation.startswith("no_grad_"):
-            return
-        impl_name = original_implementation
-        if impl_name == "eager":
-            impl_name = f"eager_{type(attn).__name__}"
-        no_grad_name = "no_grad_" + impl_name
-        if no_grad_name not in ALL_ATTENTION_FUNCTIONS:
+        index = self.name_to_index[hookpoint]
 
-            @torch.compile
-            def new_attention_forward(
-                module, query, key, value, attention_mask, *, impl_fn, **kwargs
-            ):
-                query = query.detach()
-                key = key.detach()
-                _, attn_weights = impl_fn(
-                    module, query, key, value, attention_mask, **kwargs
+        def freeze_slice(module, input, output, start, end):
+            if start == 0 and end == output.shape[-1]:
+                return output.detach()
+            indices = torch.arange(output.shape[-1], device=output.device)
+            mask = (indices >= start) & (indices < end)
+            output = torch.where(mask, output.detach(), output)
+            return output
+
+        for module, start, end in (self.attn_q_slice(index), self.attn_k_slice(index)):
+            module.register_forward_hook(
+                partial(
+                    freeze_slice,
+                    start=torch.tensor(start, device=self.device),
+                    end=torch.tensor(end, device=self.device),
                 )
-                attn_weights = attn_weights.detach()
-
-                attn_output = torch.matmul(attn_weights, value)
-                attn_output = attn_output.transpose(1, 2)
-
-                return attn_output, attn_weights
-
-            def neo_attn_wrapper(
-                self, query, key, value, attention_mask=None, head_mask=None
-            ):
-                # Keep the attention weights computation in fp32 to avoid overflow issues
-                query = query.to(torch.float32)
-                key = key.to(torch.float32)
-
-                attn_weights = torch.matmul(query, key.transpose(-1, -2))
-
-                # Apply sliding window masking for local attention layers
-                query_length, key_length = query.size(-2), key.size(-2)
-                causal_mask = self.bias[
-                    :, :, key_length - query_length : key_length, :key_length
-                ]
-                mask_value = torch.finfo(attn_weights.dtype).min
-                # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
-                # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
-                mask_value = torch.tensor(
-                    mask_value, dtype=attn_weights.dtype, device=attn_weights.device
-                )
-                attn_weights = torch.where(causal_mask, attn_weights, mask_value)
-
-                if attention_mask is not None:  # no matter the length, we just slice it
-                    causal_mask = attention_mask[:, :, :, : key.shape[-2]]
-                    attn_weights = attn_weights + causal_mask
-
-                attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
-                attn_weights = attn_weights.to(value.dtype)
-                attn_weights = self.attn_dropout(attn_weights)
-
-                # Mask heads if we want to
-                if head_mask is not None:
-                    attn_weights = attn_weights * head_mask
-
-                # freeze QK
-                attn_weights = attn_weights.detach()
-
-                attn_output = torch.matmul(attn_weights, value)
-
-                return attn_output, attn_weights
-
-            if isinstance(self.model, GPT2PreTrainedModel):
-                eager_attention_forward = gpt2_eager_attention_forward
-                ALL_ATTENTION_FUNCTIONS[no_grad_name] = partial(
-                    new_attention_forward,
-                    impl_fn=ALL_ATTENTION_FUNCTIONS[original_implementation]
-                    if eager_attention_forward is None
-                    or original_implementation != "eager"
-                    else eager_attention_forward,
-                )
-            elif isinstance(self.model, GPTNeoPreTrainedModel):
-                GPTNeoSelfAttention._attn = neo_attn_wrapper
-            else:
-                raise ValueError(f"Unsupported model type: {type(self.model)}")
-
-        attn.config._attn_implementation = no_grad_name
+            )

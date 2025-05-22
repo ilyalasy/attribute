@@ -18,17 +18,32 @@ dependencies = [
     "ruff>=0.11.6",
     "seaborn>=0.13.2",
     "simple-parsing>=0.1.7",
-    "torch>=2.6.0",
+    "torch>=2.7.0",
+    "pytorch-triton>=3.3.0",
     "transformers>=4.51.3",
 ]
 
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+[tool.uv]
+prerelease = "allow"
 [tool.uv.sources]
-eai-delphi = { git = "https://github.com/EleutherAI/delphi" }
+torch = [
+    { index = "pytorch" },
+]
+pytorch-triton = [
+    { index = "pytorch" }
+]
+
+# eai-delphi = { git = "https://github.com/EleutherAI/delphi" }
+eai-delphi = { path = "../delphi", editable = true }
 # eai-sparsify = { path = "../e2e", editable = true }
 eai-sparsify = { git = "https://github.com/EleutherAI/sparsify", branch="clt" }
 
 
 [tool.ruff]
-exclude = ["feature_vis.py", "accuracy.py", "autopatch.py"]
+exclude = ["feature_vis.py", "accuracy.py", "autopatch.py", "self_explanation.py"]
 # Ignore F722 for jaxtyping
 ignore = ["F722"]
