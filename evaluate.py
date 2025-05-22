@@ -60,6 +60,12 @@ def parse_args():
         default=128,
         help="Maximum sequence length for evaluation",
     )
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=128,
+        help="Maximum number of steps for evaluation",
+    )
     return parser.parse_args()
 
 
