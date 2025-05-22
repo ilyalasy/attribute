@@ -2,42 +2,65 @@
 # Calculates token-level accuracy and KL divergence between predicted and true distributions
 import argparse
 import json
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
-from collections import OrderedDict
 
 import IPython
+
 if ip := IPython.get_ipython():
     ip.run_line_magic("load_ext", "autoreload")
     ip.run_line_magic("autoreload", "2")
 
-from attribute.caching import TranscodedModel
-from sparsify.data import chunk_and_tokenize
-from datasets import load_dataset
 from multiprocessing import cpu_count
-from tqdm.auto import tqdm
+
+import numpy as np
 import torch
 import torch.nn.functional as F
-import numpy as np
+from datasets import load_dataset
 from loguru import logger
+from sparsify.data import chunk_and_tokenize
+from tqdm.auto import tqdm
+
+from attribute.caching import TranscodedModel
+
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Evaluate model accuracy and KL divergence on next token prediction')
-    parser.add_argument('--model', type=str, default="nev/GELU_4L512W_C4_Code",
-                      help='Model name or path')
-    parser.add_argument('--transcoder_path', type=str,
-                      default="../e2e/checkpoints/gelu-4l-clt/ef128k64",
-                      help='Path to transcoder')
-    parser.add_argument('--mlp_trim', type=int,
-                      default=0,
-                      help='Fix MLP L0 to this value')
-    parser.add_argument('--output_path', type=str, default="results/accuracy",
-                      help='Directory to save results')
-    parser.add_argument('--batch_size', type=int, default=128,
-                      help='Batch size for evaluation')
-    parser.add_argument('--max_seq_len', type=int, default=128,
-                      help='Maximum sequence length for evaluation')
+    parser = argparse.ArgumentParser(
+        description="Evaluate model accuracy and KL divergence on next token prediction"
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="roneneldan/TinyStories-33M",
+        help="Model name or path",
+    )
+    parser.add_argument(
+        "--transcoder_path",
+        type=str,
+        default="/share/ilya.lasy/transcoders/clt-128",
+        help="Path to transcoder",
+    )
+    parser.add_argument(
+        "--mlp_trim", type=int, default=0, help="Fix MLP L0 to this value"
+    )
+    parser.add_argument(
+        "--output_path",
+        type=str,
+        default="results/accuracy",
+        help="Directory to save results",
+    )
+    parser.add_argument(
+        "--batch_size", type=int, default=128, help="Batch size for evaluation"
+    )
+    parser.add_argument(
+        "--max_seq_len",
+        type=int,
+        default=128,
+        help="Maximum sequence length for evaluation",
+    )
     return parser.parse_args()
+
 
 def main():
     args = parse_args()
@@ -48,28 +71,28 @@ def main():
         transcoder_path=args.transcoder_path if args.mlp_trim == 0 else None,
     )
 
+    dataset_name = "roneneldan/TinyStories"
     # Load and preprocess dataset into fixed-length chunks for efficient batching
-    dataset = load_dataset("NeelNanda/pile-10k", split="train")
+    dataset = load_dataset(dataset_name, split="train").select(
+        range(10000)
+    )  # Load only 10k samples
     dataset = chunk_and_tokenize(
         dataset,
         model.tokenizer,
         max_seq_len=args.max_seq_len,
         num_proc=cpu_count() // 2,
         text_key="text",
-        return_overflowed_tokens=True,
     )
 
     # Setup data loading with multiprocessing
     logger.remove()  # Remove default logger to avoid clutter during evaluation
     dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        num_workers=cpu_count() // 2
+        dataset, batch_size=args.batch_size, num_workers=cpu_count() // 2
     )
 
     # Track metrics across batches
     accuracies = []  # Token-level accuracy
-    kl_divs = []    # KL divergence between predicted and true distributions
+    kl_divs = []  # KL divergence between predicted and true distributions
 
     def mlp_trimmer(module, input, output):
         values, indices = torch.topk(output, args.mlp_trim, dim=-1)
@@ -86,7 +109,9 @@ def main():
                 base_logits = out_base.logits
                 if args.mlp_trim > 0:
                     for layer_idx in range(model.num_layers):
-                        mlp = model.model.get_submodule(f"{model.layer_prefix}.{layer_idx}.mlp")
+                        mlp = model.model.get_submodule(
+                            f"{model.layer_prefix}.{layer_idx}.mlp"
+                        )
                         in_proj = getattr(mlp, model.mlp_in_proj_name)
                         in_proj.register_forward_hook(mlp_trimmer)
                     out = model.model(input_ids)
@@ -103,23 +128,29 @@ def main():
                 accuracies.append(accuracy)
 
                 # Calculate KL divergence between predicted and true distributions
-                log_probs = F.log_softmax(logits, dim=-1)  # [batch, seq_len, vocab_size]
-                base_log_probs = F.log_softmax(base_logits, dim=-1)  # [batch, seq_len, vocab_size]
+                log_probs = F.log_softmax(
+                    logits, dim=-1
+                )  # [batch, seq_len, vocab_size]
+                base_log_probs = F.log_softmax(
+                    base_logits, dim=-1
+                )  # [batch, seq_len, vocab_size]
 
                 # Calculate KL divergence for this batch
                 kl_div = F.kl_div(
                     log_probs.view(-1, logits.size(-1)),
                     base_log_probs.view(-1, logits.size(-1)),
-                    reduction='batchmean',
-                    log_target=True
+                    reduction="batchmean",
+                    log_target=True,
                 ).item()
                 kl_divs.append(kl_div)
 
                 # Update progress bar with current and running average metrics
-                bar.set_postfix({
-                    "Avg Acc": f"{np.mean(accuracies):.4f}",
-                    "Avg KL": f"{np.mean(kl_divs):.4f}"
-                })
+                bar.set_postfix(
+                    {
+                        "Avg Acc": f"{np.mean(accuracies):.4f}",
+                        "Avg KL": f"{np.mean(kl_divs):.4f}",
+                    }
+                )
     except KeyboardInterrupt:
         pass
 
@@ -147,11 +178,13 @@ def main():
             "std": std_kl,
         },
         "metadata": {
-            "dataset": "NeelNanda/pile-10k",
+            "dataset": dataset_name,
             "batch_size": args.batch_size,
             "num_batches": len(accuracies),
-            "total_tokens": len(accuracies) * args.batch_size * (args.max_seq_len - 1),  # -1 for next token prediction
-        }
+            "total_tokens": len(accuracies)
+            * args.batch_size
+            * (args.max_seq_len - 1),  # -1 for next token prediction
+        },
     }
 
     # Save results with timestamp for tracking experiments
@@ -164,7 +197,7 @@ def main():
     escaped_model_transcoder_name = f"{escaped_model_name}-{escaped_transcoder_name}"
     output_file = output_dir / f"eval_results_{escaped_model_transcoder_name}.json"
 
-    with open(output_file, 'w') as f:
+    with open(output_file, "w") as f:
         json.dump(results, f, indent=2)
 
     # Print summary statistics
@@ -172,6 +205,7 @@ def main():
     print(f"Token Accuracy: {mean_accuracy:.4f} ± {std_accuracy:.4f}")
     print(f"KL Divergence: {mean_kl:.4f} ± {std_kl:.4f}")
     print(f"Results saved to: {output_file}")
+
 
 if __name__ == "__main__":
     main()
