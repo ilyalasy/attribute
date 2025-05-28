@@ -17,6 +17,8 @@ async def main(
     name = "test-1-ts",
     scan = "default",
     remove_prefix = 0,
+    pre_ln_hook = False,
+    **kwargs,
 ):
     logger.remove()
     logger.add(sys.stderr, level="INFO")
@@ -24,31 +26,24 @@ async def main(
     config = AttributionConfig(
         name=name,
         scan=scan,
+        **kwargs
     )
     model = TranscodedModel(
         model_name=model_name,
         transcoder_path=transcoder_path,
         device="cuda",
+        pre_ln_hook=pre_ln_hook,
     )
-    transcoded_outputs = model(prompt)
-
-    if remove_prefix > 0:
-        transcoded_outputs.input_ids = transcoded_outputs.input_ids[:, remove_prefix:]
-        # only ever accessed w/ [-1], removing BOS doesn't matter
-        # transcoded_outputs.last_layer_activations = transcoded_outputs.last_layer_activations[:, 1:]
-        transcoded_outputs.logits = transcoded_outputs.logits[:, remove_prefix:]
-        for k, mlp_output in transcoded_outputs.mlp_outputs.items():
-            mlp_output.ln_factor = mlp_output.ln_factor[:, remove_prefix:]
-            mlp_output.activation = mlp_output.activation[:, remove_prefix:]
-            mlp_output.location = mlp_output.location[:, remove_prefix:]
-            mlp_output.error = mlp_output.error[:, remove_prefix:]
-            # we don't remove BOS from source nodes because we take gradients to them
+    transcoded_outputs = model([prompt] * config.batch_size)
+    transcoded_outputs.remove_prefix(remove_prefix)
 
     attribution_graph = AttributionGraph(model, transcoded_outputs, config)
     attribution_graph.get_dense_features(cache_path)
     attribution_graph.flow()
     attribution_graph.save_graph(save_dir)
-    await attribution_graph.cache_features(cache_path, save_dir)
+    attribution_graph.cache_features(cache_path, save_dir)
+    attribution_graph.cache_self_explanations(cache_path, save_dir)
+    await attribution_graph.cache_contexts(cache_path, save_dir)
 
 
 if __name__ == "__main__":

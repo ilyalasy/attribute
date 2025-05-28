@@ -15,12 +15,15 @@ window.initFeatureExamples = function({containerSel, showLogits=true, showExampl
 
   // set up dom and render fns
   var sel = containerSel.html('').append('div.feature-examples')
-  if (visState.showLogits) sel.append('div.feature-example-logits')
+  if (visState.showLogits) {
+    sel.append('div.feature-example-logits')
+    sel.append('div.feature-example-self-explanation')
+  }
   if (visState.showExamples) sel.append('div.feature-example-list')
   var renderAll = util.initRenderAll(['feature'])
 
 
-  if (visState.showLogits) window.initFeatureExamplesLogits({renderAll, visState, sel})
+  if (visState.showLogits) window.initFeatureExamplesExtra({renderAll, visState, sel})
   if (visState.showExamples) window.initFeatureExamplesList({renderAll, visState, sel})
 
   return {loadFeature, renderFeature}

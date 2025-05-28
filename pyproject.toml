@@ -21,6 +21,8 @@ dependencies = [
     "torch>=2.7.0",
     "pytorch-triton>=3.3.0",
     "transformers>=4.51.3",
+    "gradio>=5.30.0",
+    "neuronpedia>=1.0.20",
 ]
 
 [[tool.uv.index]]
@@ -37,8 +39,7 @@ pytorch-triton = [
     { index = "pytorch" }
 ]
 
-# eai-delphi = { git = "https://github.com/EleutherAI/delphi" }
-eai-delphi = { path = "../delphi", editable = true }
+eai-delphi = { git = "https://github.com/EleutherAI/delphi" }
 # eai-sparsify = { path = "../e2e", editable = true }
 eai-sparsify = { git = "https://github.com/EleutherAI/sparsify", branch="clt" }
 

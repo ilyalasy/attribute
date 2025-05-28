@@ -56,6 +56,20 @@ class TranscodedOutputs:
     def batch_size(self):
         return self.input_ids.shape[0]
 
+    def remove_prefix(self, remove_prefix: int):
+        if remove_prefix > 0:
+            self.input_ids = self.input_ids[:, remove_prefix:]
+            # only ever accessed w/ [-1], removing BOS doesn't matter
+            # transcoded_outputs.last_layer_activations = transcoded_outputs.last_layer_activations[:, 1:]
+            self.logits = self.logits[:, remove_prefix:]
+            for k, mlp_output in self.mlp_outputs.items():
+                mlp_output.ln_factor = mlp_output.ln_factor[:, remove_prefix:]
+                mlp_output.activation = mlp_output.activation[:, remove_prefix:]
+                mlp_output.location = mlp_output.location[:, remove_prefix:]
+                mlp_output.error = mlp_output.error[:, remove_prefix:]
+                assert mlp_output.location.shape[1] == self.input_ids.shape[1]
+                # we don't remove BOS from source nodes because we take gradients to them
+
 
 class TranscodedModel(object):
     @torch.no_grad()
@@ -65,6 +79,7 @@ class TranscodedModel(object):
         transcoder_path: os.PathLike,
         hookpoint_fn=None,
         device="cuda",
+        pre_ln_hook: bool = False,
     ):
         logger.info(f"Loading model {model_name} on device {device}")
         self.device = device
@@ -148,6 +163,7 @@ class TranscodedModel(object):
             for i, k in enumerate(arr)
         }
         self.module_to_name = {v: k for k, v in self.name_to_module.items()}
+        self.pre_ln_hook = pre_ln_hook
 
     def clear_hooks(self):
         for mod in self.model.modules():
@@ -168,10 +184,11 @@ class TranscodedModel(object):
 
     def __call__(
         self,
-        prompt: str | torch.Tensor,
+        prompt: str | list[str] | torch.Tensor,
         mask_features: dict[int, list[int]] = {},
         steer_features: dict[int, list[(int, int, float)]] = {},
         errors_from: TranscodedOutputs | None = None,
+        latents_from_errors: bool = False,
         no_error: bool = False,
     ) -> TranscodedOutputs:
         if isinstance(prompt, str):
@@ -181,6 +198,11 @@ class TranscodedModel(object):
             logger.info(
                 f"Tokenized prompt: {[self.decode_token(i) for i in tokenized_prompt.input_ids[0]]}"
             )
+        elif isinstance(prompt, list):
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            tokenized_prompt = self.tokenizer(
+                prompt, return_tensors="pt", padding=True
+            ).to(self.device)
         elif isinstance(prompt, torch.Tensor):
             tokenized_prompt = SimpleNamespace(input_ids=prompt.to(self.device))
         else:
@@ -208,6 +230,17 @@ class TranscodedModel(object):
                 partial(ln_record_hook, save_dict=second_ln)
             )
 
+        if self.pre_ln_hook:
+            resid_mid = {}
+
+            def record_resid_mid(module, input, output):
+                if isinstance(input, tuple):
+                    input = input[0]
+                resid_mid[self.name_to_index[self.module_to_name[module]]] = input
+
+            for hookpoint in self.hookpoints_ln:
+                self.name_to_module[hookpoint].register_forward_hook(record_resid_mid)
+
         errors = {}
         source_activations = {}
         target_activations = {}
@@ -218,9 +251,40 @@ class TranscodedModel(object):
                 input = input[0]
             batch_dims = input.shape[:-1]
             module_name = self.module_to_name[module]
+            layer_idx = self.name_to_index[module_name]
+            if self.pre_ln_hook:
+                input = resid_mid[layer_idx]
+
+            # have to reshape input to lose the batch dimension
+            batch_dims = input.shape[:-1]
+            input = input.view(-1, input.shape[-1])
+            # have to normalize input
+            latent_acts = self.clt.encode(input, layer_idx)
 
             layer_idx = self.name_to_index[module_name]
-            latent_acts = self.clt.encode(input, layer_idx)
+            masked_features = mask_features.get(layer_idx, [])
+            steered_features = steer_features.get(layer_idx, [])
+            if latents_from_errors:
+                act = errors_from.mlp_outputs[layer_idx].activation
+                latent_acts = act.view(-1, act.shape[-1])
+            if masked_features:
+                # TODO: CHECK THIS
+                mask = torch.ones_like(latent_acts)
+                mask[masked_features] = 0
+                latent_acts = latent_acts * mask.float()
+            if steered_features:
+                acts = latent_acts
+                acts = acts.view(*batch_dims, -1)
+                for seq_idx, feature, strength in steered_features:
+                    prev_activations = acts[0, seq_idx].tolist()
+                    if 0.0 not in prev_activations:
+                        acts = torch.nn.functional.pad(acts, (0, 1))
+                        acts[:, seq_idx, -1] = strength
+                    else:
+                        zero_index = prev_activations.index(0.0)
+                        acts[:, seq_idx, zero_index] = strength
+                acts = acts.view(-1, acts.shape[-1])
+                latent_acts = acts
 
             l0 = (latent_acts != 0).float().sum(dim=-1).mean().item()
             l0s[module_name] = l0
@@ -260,6 +324,9 @@ class TranscodedModel(object):
             error.detach_()
             error.requires_grad_(True)
             logger.info(f"Layer {module_name} error: {diff.norm() / output.norm()}")
+
+            target_activations[module_name] = target_latent_acts
+            source_activations[module_name] = source_latent_acts
 
             result = (transcoder_out + error).to(output)
             errors[module_name] = error
@@ -352,13 +419,17 @@ class TranscodedModel(object):
             raise ValueError(f"Unsupported model type: {type(self.model)}")
 
     @property
-    def embedding_weight(self):
+    def embedding_module(self):
         if isinstance(self.model, LlamaLike):
-            return self.model.model.embed_tokens.weight
+            return self.model.model.embed_tokens
         elif isinstance(self.model, GPT2Like):
-            return self.model.transformer.wte.weight
+            return self.model.transformer.wte
         else:
             raise ValueError(f"Unsupported model type: {type(self.model)}")
+
+    @property
+    def embedding_weight(self):
+        return self.embedding_module.weight
 
     @property
     def parallel_attn(self):
@@ -438,8 +509,11 @@ class TranscodedModel(object):
     def w_enc(self, layer_idx: int) -> Float[Array, "features hidden_size"]:
         return self.clt.encoder.encoders[layer_idx].weight
 
+    def get_layer(self, layer_idx: int) -> torch.nn.Module:
+        return self.model.get_submodule(self.layer_prefix)[layer_idx]
+
     def attn(self, layer_idx: int) -> torch.nn.Module:
-        layer = self.model.get_submodule(self.layer_prefix)[layer_idx]
+        layer = self.get_layer(layer_idx)
         if isinstance(self.model, LlamaLike):
             return layer.self_attn
         elif isinstance(self.model, GPTNeoPreTrainedModel):

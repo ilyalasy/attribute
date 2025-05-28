@@ -69,6 +69,7 @@ class OutputNode(Node):
     probability: float
     logit: float
     input_vector: Tensor
+    logit_idx: int
 
 
 @dataclass

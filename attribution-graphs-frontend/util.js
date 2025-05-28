@@ -46,6 +46,9 @@ window.util = (function () {
     // If path starts with /, treat as relative to static_js directory
     if (path.startsWith('/')) {
       // path = 'https://transformer-circuits.pub/2025/attribution-graphs' + path
+      var base = window.location.href;
+      base = base.substring(0, base.lastIndexOf('/') + 1);
+      path = base + path;
     }
 
     // Return cached result if available

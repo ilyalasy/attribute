@@ -1,10 +1,13 @@
 #!/bin/sh
 # set -e
-uv run python evaluate.py --model gpt2 --transcoder_path ../e2e/checkpoints/clt-gpt2/coal-per-k8
-uv run python evaluate.py --model gpt2 --transcoder_path ../e2e/checkpoints/clt-gpt2/const-k8
-uv run python evaluate.py --model gpt2 --transcoder_path ../e2e/checkpoints/clt-gpt2/no-clt
-uv run python evaluate.py --model gpt2 --transcoder_path ../e2e/checkpoints/clt-gpt2/coal
-uv run python evaluate.py --model gpt2 --transcoder_path ../sparsify/checkpoints/clt-gpt2/new-run
+
+uv run python evaluate.py --model meta-llama/Llama-3.2-1B --transcoder_path ../sparsify/checkpoints/llama-finetune/test-0 --batch_size 64
+
+# uv run python evaluate.py --model gpt2 --transcoder_path ../e2e/checkpoints/clt-gpt2/coal-per-k8
+# uv run python evaluate.py --model gpt2 --transcoder_path ../e2e/checkpoints/clt-gpt2/const-k8
+# uv run python evaluate.py --model gpt2 --transcoder_path ../e2e/checkpoints/clt-gpt2/no-clt
+# uv run python evaluate.py --model gpt2 --transcoder_path ../e2e/checkpoints/clt-gpt2/coal
+# uv run python evaluate.py --model gpt2 --transcoder_path ../sparsify/checkpoints/clt-gpt2/new-run
 
 
 # uv run python evaluate.py --transcoder_path ../e2e/checkpoints/gelu-4l-clt/ef128k64

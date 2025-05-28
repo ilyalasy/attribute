@@ -1,22 +1,23 @@
 import json
 import os
 import random
-from collections import defaultdict
+import numpy as np
+import torch
+from collections import defaultdict, OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Literal
 
-import numpy as np
-import torch
 from delphi.config import ConstructorConfig, SamplerConfig
 from delphi.latents import LatentDataset
 from loguru import logger
 from tqdm.auto import tqdm, trange
+from jaxtyping import Float, Int, Bool, Array
 
 from .caching import TranscodedModel, TranscodedOutputs
 from .nodes import (Contribution, Edge, ErrorNode, InputNode, IntermediateNode,
                     Node, OutputNode)
-from .utils import cantor, infcache, measure_time
+from .utils import cantor, measure_time
 
 
 @dataclass
@@ -25,9 +26,13 @@ class AttributionConfig:
     name: str
     # ID for the model the features are from
     scan: str
+    # seed for random number generator
+    seed: int = 42
 
     # how many target nodes to compute contributions for
-    flow_steps: int = 500
+    flow_steps: int = 5000
+    # batch size for MLP attribution
+    batch_size: int = 8
     # whether to use the softmax gradient for the output node
     # instead of the logit
     softmax_grad_type: Literal["softmax", "mean", "straight"] = "mean"
@@ -37,13 +42,13 @@ class AttributionConfig:
 
     # remove MLP edges below this threshold
     pre_filter_threshold: float = 1e-3
-    # keep edges above this threshold
-    edge_threshold = 1e-3
+    # keep edges that make up this fraction of the total influence
+    edge_cum_threshold: float = 0.95
     # keep top k edges for each node
-    top_k_edges: int = 128
+    top_k_edges: int = 32
 
-    # always keep nodes above this threshold of influence
-    node_threshold = 5e-4
+    # keep nodes that make up this fraction of the total influence
+    node_cum_threshold: float = 0.8
     # keep per_layer_position nodes above this threshold for each layer/position pair
     secondary_threshold = 1e-5
     per_layer_position = 0
@@ -53,6 +58,14 @@ class AttributionConfig:
 
     # correct for bias when saving top output logits
     use_logit_bias: bool = False
+
+    use_self_explanation: bool = False
+    selfe_min_strength: float = 2.0
+    selfe_max_strength: float = 8.0
+    self_sim_layer: int = 15
+    selfe_n: int = 64
+    selfe_pick: int = 5
+    selfe_n_tokens: int = 8
 
 
 class AttributionGraph:
@@ -69,6 +82,9 @@ class AttributionGraph:
         self.edges: dict[str, Edge] = {}
         self.nodes_by_layer_and_token: dict[int, dict[int, list[Node]]] = {}
         self.initialize_graph()
+        random.seed(self.config.seed)
+        np.random.seed(self.config.seed)
+        torch.manual_seed(self.config.seed)
 
     @property
     def tokenizer(self):
@@ -117,6 +133,8 @@ class AttributionGraph:
         return adj_matrix, dedup_node_names
 
     def make_latent_dataset(self, cache_path: os.PathLike, module_latents: dict[str, torch.Tensor]):
+        if self.model.pre_ln_hook and module_latents:
+            module_latents = {k.replace(".mlp", f".{self.model.mlp_layernorm_name}"): v for k, v in module_latents.items()}
         return LatentDataset(
             cache_path,
             SamplerConfig(n_examples_train=10, train_type="top", n_examples_test=0),
@@ -159,16 +177,18 @@ class AttributionGraph:
         else:
             influence = self.influence
 
+        original_adj_matrix = adj_matrix
+
         influence = np.abs(influence) * activation_sources
         influence = influence / np.maximum(1e-2, influence.sum(axis=1, keepdims=True))
         adj_matrix = np.abs(adj_matrix) * activation_sources
         adj_matrix = adj_matrix / np.maximum(1e-2, adj_matrix.sum(axis=1, keepdims=True))
 
         total_error_influence = 1 - (influence_sources @ adj_matrix) @ error_mask
-        logger.info(f"Completeness score: {total_error_influence:.3f}")
+        logger.info(f"Completeness score (unpruned): {total_error_influence:.3f}")
 
         total_error_influence = 1 - (influence_sources @ influence) @ error_mask
-        logger.info(f"Replacement score: {total_error_influence:.3f}")
+        logger.info(f"Replacement score (unpruned): {total_error_influence:.3f}")
 
         usage = influence_sources @ influence
         logger.info(f"Top influences: {usage[np.argsort(usage)[-10:][::-1]].tolist()}")
@@ -178,6 +198,12 @@ class AttributionGraph:
                   if self.nodes[node].node_type in ("OutputNode",)
                   + (("InputNode",) if self.config.keep_all_input_nodes else ())
                   + (("ErrorNode",) if self.config.keep_all_error_nodes else ())]
+
+        sorted_usage = np.sort(usage)[::-1]
+        cumsum_usage = np.cumsum(sorted_usage)
+        cumsum_usage = cumsum_usage / cumsum_usage[-1]
+        node_threshold = sorted_usage[np.searchsorted(cumsum_usage, self.config.node_cum_threshold)]
+
         for seq_idx in range(self.cache.input_ids.shape[-1]):
             for layer_idx in range(self.num_layers):
                 matching_nodes = [
@@ -190,25 +216,55 @@ class AttributionGraph:
                 matching_nodes = matching_nodes[:self.config.per_layer_position] + [
                     node
                     for node in matching_nodes[self.config.per_layer_position:]
-                    if usage[dedup_node_indices[node]] > self.config.node_threshold
+                    if usage[dedup_node_indices[node]] > node_threshold
                 ]
                 matching_nodes = [
                     node for node in matching_nodes
                     if usage[dedup_node_indices[node]] > self.config.secondary_threshold
                 ]
                 selected_nodes.extend(matching_nodes)
+
         logger.info(f"Selected {len(selected_nodes)} nodes")
+
+        filtered_mask = np.zeros((len(dedup_node_names),), dtype=bool)
+        for node in selected_nodes:
+            filtered_mask[dedup_node_indices[node]] = 1
+        for node in dedup_node_names:
+            if node.startswith("error"):
+                filtered_mask[dedup_node_indices[node]] = 1
+        filtered_index = np.cumsum(filtered_mask) - 1
+
+        filtered_adj_matrix = original_adj_matrix[filtered_mask][:, filtered_mask]
+        filtered_influence = np.linalg.inv(np.eye(len(filtered_adj_matrix)) - filtered_adj_matrix) - np.eye(len(filtered_adj_matrix))
+
+        filtered_influence = np.abs(filtered_influence) * activation_sources[filtered_mask]
+        filtered_influence = filtered_influence / np.maximum(1e-2, filtered_influence.sum(axis=1, keepdims=True))
+        filtered_adj_matrix = np.abs(filtered_adj_matrix) * activation_sources[filtered_mask]
+        filtered_adj_matrix = filtered_adj_matrix / np.maximum(1e-2, filtered_adj_matrix.sum(axis=1, keepdims=True))
+
+        total_pruned_influence = float(1 - (influence_sources[filtered_mask] @ filtered_adj_matrix) @ error_mask[filtered_mask])
+        logger.info(f"Completeness score: {total_pruned_influence:.3f}")
+        total_pruned_influence = float(1 - (influence_sources[filtered_mask] @ filtered_influence) @ error_mask[filtered_mask])
+        logger.info(f"Replacement score: {total_pruned_influence:.3f}")
 
         export_nodes = []
         for n in selected_nodes:
             export_nodes.append(self.nodes[n])
         self.exported_nodes = export_nodes
 
+        selected_edge_matrix = np.sort(filtered_influence.flatten())[::-1]
+        edge_cumsum = np.cumsum(selected_edge_matrix)
+        edge_cumsum = edge_cumsum / edge_cumsum[-1]
+        edge_threshold = selected_edge_matrix[np.searchsorted(edge_cumsum, self.config.edge_cum_threshold)]
+
         export_edges = []
         for edge in self.edges.values():
             if not (edge.source.id in selected_nodes and edge.target.id in selected_nodes):
                 continue
-            if abs(influence[dedup_node_indices[edge.target.id], dedup_node_indices[edge.source.id]]) < self.config.edge_threshold:
+            if abs(
+                filtered_influence[filtered_index[dedup_node_indices[edge.target.id]],
+                                   filtered_index[dedup_node_indices[edge.source.id]]]
+                ) < edge_threshold:
                 continue
             export_edges.append(edge)
         self.exported_edges = export_edges
@@ -226,6 +282,7 @@ class AttributionGraph:
             prompt="".join(tokens),
             title_prefix="",
             n_layers=self.model.num_layers,
+            node_threshold=node_threshold,
         )
 
         nodes_json = [
@@ -293,11 +350,13 @@ class AttributionGraph:
         (save_dir / "data").mkdir(parents=True, exist_ok=True)
         open(save_dir / "data/graph-metadata.json", "w").write(json.dumps(dict(graphs=metadatas)))
 
+        return circuit_path
+
     def get_dense_features(self, cache_path: os.PathLike):
         cache_path = Path(cache_path)
         dense_features = set()
-        if not cache_path.exists() or not self.config.filter_high_freq_early:
-            logger.warning("Skipping dead feature detection because cache does not exist or filter_high_freq_early is 0")
+        if not cache_path.exists() or not len(list(cache_path.glob("*"))) or not self.config.filter_high_freq_early:
+            logger.warning("Skipping dense feature detection because cache does not exist or filter_high_freq_early is 0")
             self.dense_features = dense_features
             return
         dense_cache_path = cache_path.parent / "dense_features.json"
@@ -321,43 +380,189 @@ class AttributionGraph:
                 too_high = freqs > self.config.filter_high_freq_early
 
                 # dead_features[module].extend(unique[too_high].tolist())
+                if self.model.pre_ln_hook:
+                    module = module.replace(f".{self.model.mlp_layernorm_name}", ".mlp")
                 layer_idx = self.model.temp_hookpoints_mlp.index(module)
-                feature_names = [f"{layer_idx}_{feature}" for feature in unique[too_high].tolist()]
+                feature_names = [[layer_idx, feature] for feature in unique[too_high].tolist()]
                 dense.extend(feature_names)
             open(dense_cache_path, "w").write(json.dumps(dense))
 
-        self.dense_features = set(f"intermediate_{pos}_{feature}" for pos in range(self.seq_len) for feature in dense)
+        self.dense_features = set((pos, *feature) for pos in range(self.seq_len) for feature in dense)
 
-    async def cache_features(self, cache_path: os.PathLike, save_dir: os.PathLike):
+    def cache_features(self, cache_path: os.PathLike, save_dir: os.PathLike):
+        cache_path = Path(cache_path)
+        save_dir = Path(save_dir)
+        logit_weight = self.model.logit_weight
+        logit_bias = self.model.logit_bias
+        for node in tqdm(self.exported_nodes, desc="Caching features"):
+            if node.node_type == "IntermediateNode":
+                feature_dir = save_dir / "features" / self.config.scan
+
+                layer, feature = int(node.layer_index), int(node.feature_index)
+
+                with torch.no_grad(), torch.autocast("cuda"):
+                    try:
+                        logger.disable("attribute.caching")
+                        dec_weight = self.model.w_dec(layer)[feature]
+                    finally:
+                        logger.enable("attribute.caching")
+                    logits = logit_weight @ dec_weight
+                    del dec_weight
+                    if self.config.use_logit_bias:
+                        logits += logit_bias
+                    top_logits = logits.topk(10).indices.tolist()
+                    bottom_logits = logits.topk(10, largest=False).indices.tolist()
+                top_logits = [self.model.decode_token(i) for i in top_logits]
+                bottom_logits = [self.model.decode_token(i) for i in bottom_logits]
+
+                feature_vis = dict(
+                    index=cantor(layer, feature),
+                    bottom_logits=bottom_logits,
+                    top_logits=top_logits,
+                )
+                feature_dir.mkdir(parents=True, exist_ok=True)
+                feature_path = feature_dir / f"{cantor(layer, feature)}.json"
+                if feature_path.exists():
+                    feature_vis = json.loads(feature_path.read_text()) | feature_vis
+                feature_path.write_text(json.dumps(feature_vis))
+
+    def cache_self_explanations(self, cache_path: os.PathLike, save_dir: os.PathLike):
+        if not self.config.use_self_explanation:
+            return
+        cache_path = Path(cache_path)
+        save_dir = Path(save_dir)
+        for node in tqdm(self.exported_nodes, desc="Caching self-explanations"):
+            if node.node_type == "IntermediateNode":
+                explanation = self.self_explain_feature(node)
+                feature_dir = save_dir / "features" / self.config.scan
+                feature_dir.mkdir(parents=True, exist_ok=True)
+                feature_path = feature_dir / f"{cantor(node.layer_index, node.feature_index)}.json"
+                if feature_path.exists():
+                    explanation = json.loads(feature_path.read_text()) | explanation
+                feature_path.write_text(json.dumps(explanation))
+
+    @torch.inference_mode()
+    def self_explain_feature(self, node: IntermediateNode):
+        layer, feature = node.layer_index, node.feature_index
+        w_dec = self.model.w_dec(layer, use_skip=True)[feature]
+        w_enc = self.model.w_enc(layer)[feature]
+        strengths = torch.linspace(self.config.selfe_min_strength, self.config.selfe_max_strength, self.config.selfe_n, device=self.model.device)
+        w_dec = w_dec[None, :] * strengths[:, None]
+        w_enc = w_enc[None, :] * strengths[:, None]
+        dec_explanations = self.self_explain_generate(w_dec, min_strength=self.config.selfe_min_strength, max_strength=self.config.selfe_max_strength, seq_len=self.config.selfe_n_tokens)
+        enc_explanations = self.self_explain_generate(w_enc, min_strength=self.config.selfe_min_strength, max_strength=self.config.selfe_max_strength, seq_len=self.config.selfe_n_tokens)
+        return dict(
+            self_explanation_enc=enc_explanations,
+            self_explanation_dec=dec_explanations,
+        )
+
+    def self_explain_generate(self, vectors: torch.Tensor,
+                              *, min_strength: float,
+                              max_strength: float,
+                              seq_len: int):
+        prompt = "ONLINE DICTIONARY\nThe meaning of the word ? is \""
+        tokenized_prompt = self.model.tokenizer.encode(prompt)
+        question_mark_token = self.model.tokenizer.encode("a ?")[-1]
+        token_index = tokenized_prompt.index(question_mark_token)
+        emb_vec = vectors / vectors.norm(dim=-1, keepdim=True)
+        batch_size = vectors.shape[0]
+        strengths = torch.linspace(min_strength, max_strength, batch_size, device=self.model.device)
+        emb_vec = emb_vec[None, :] * strengths[:, None]
+        tokens = self.model.tokenizer([prompt] * batch_size, return_tensors="pt").to(self.model.device).input_ids
+        state = (tokens, tokens, None, None, None)
+        def step(state):
+            all_tokens, tokens, cache, entropy, self_similarity = state
+            for m in self.model.model.modules():
+                m._forward_hooks = OrderedDict()
+
+            if tokens.shape[1] != 1:
+                def patch(module, input, output):
+                    output[:, token_index] = emb_vec
+                    return output
+
+                self.model.embedding_module.register_forward_hook(patch)
+
+                def collect_self_similarity(module, input, output):
+                    nonlocal self_similarity
+                    if isinstance(output, tuple):
+                        output = output[0]
+                    self_similarity = torch.nn.functional.cosine_similarity(
+                        output[:, -1],
+                        emb_vec,
+                        dim=-1
+                    )[0]
+
+                self.model.get_layer(self.config.self_sim_layer).register_forward_hook(collect_self_similarity)
+
+            output = self.model.model(tokens, past_key_values=cache)
+            logits = output.logits
+
+            if entropy is None:
+                probs = torch.nn.functional.softmax(logits[:, -1], dim=-1)
+                logprobs = torch.nn.functional.log_softmax(logits[:, -1], dim=-1)
+                entropy = -torch.sum(probs * logprobs, dim=-1)
+
+            probs = torch.nn.functional.softmax(logits[:, -1], dim=-1)
+            next_tokens = torch.multinomial(probs, num_samples=1)
+            all_tokens = torch.cat([all_tokens, next_tokens], dim=1)
+            return (all_tokens, next_tokens, output.past_key_values, entropy, self_similarity)
+
+        try:
+            for _ in range(seq_len):
+                logger.disable("attribute")
+                state = step(state)
+                tokens = state[0]
+        finally:
+            logger.enable("attribute")
+        decoded = [self.model.tokenizer.decode(seq[len(tokenized_prompt):]) for seq in tokens.tolist()]
+        entropy, self_similarity = state[3:5]
+        entropy = entropy - entropy.min()
+        entropy = entropy / entropy.max()
+        self_similarity = self_similarity - self_similarity.min()
+        self_similarity = self_similarity / self_similarity.max()
+        top_self_sims = torch.topk(self_similarity, k=self.config.selfe_pick).indices.tolist()
+        decoded = [decoded[i] for i in top_self_sims]
+        # decoded = [str((float(entropy), float(self_sim))) + decoded for entropy, self_sim, decoded in zip(entropy, self_similarity, decoded)]
+        decoded = [decoded.partition('"')[0].partition("\n")[0] for decoded in decoded]
+        return decoded
+
+    async def cache_contexts(self, cache_path: os.PathLike, save_dir: os.PathLike):
+        cache_path = Path(cache_path)
+        save_dir = Path(save_dir)
+        feature_paths = {}
         module_latents = defaultdict(list)
         dead_features = set()
         for node in self.exported_nodes:
             if node.node_type == "IntermediateNode":
-                layer, feature = int(node.layer_index), int(node.feature_index)
-                dead_features.add((layer, feature))
-                module_latents[self.model.temp_hookpoints_mlp[layer]].append(feature)
+                layer_idx = node.layer_index
+                feature_idx = node.feature_index
+                feature_dir = save_dir / "features" / self.config.scan
+                feature_dir.mkdir(parents=True, exist_ok=True)
+                feature_path = feature_dir / f"{cantor(layer_idx, feature_idx)}.json"
+                if feature_path.exists():
+                    if "examples_quantiles" in json.loads(feature_path.read_text()):
+                        continue
+                feature_paths[(layer_idx, feature_idx)] = feature_path
+                module_latents[self.model.temp_hookpoints_mlp[layer_idx]].append(feature_idx)
+                dead_features.add((layer_idx, feature_idx))
+
         module_latents = {k: torch.tensor(v) for k, v in module_latents.items()}
         module_latents = {k: v[torch.argsort(v)] for k, v in module_latents.items()}
 
         ds = self.make_latent_dataset(cache_path, module_latents)
-
-        logit_weight = self.model.logit_weight
-        logit_bias = self.model.logit_bias
 
         bar = tqdm(total=sum(map(len, module_latents.values())))
         def process_feature(feature):
             layer_idx = int(feature.latent.module_name.split(".")[-2])
             feature_idx = feature.latent.latent_index
             dead_features.discard((layer_idx, feature_idx))
-            index = cantor(layer_idx, feature_idx)
 
-            feature_dir = save_dir / "features" / self.config.scan
-            feature_dir.mkdir(parents=True, exist_ok=True)
-            feature_path = feature_dir / f"{index}.json"
+            feature_path = feature_paths[(layer_idx, feature_idx)]
 
-            if feature_path.exists():
-                examples_quantiles = json.loads(feature_path.read_text())["examples_quantiles"]
-            else:
+            feature_vis = json.loads(feature_path.read_text())
+            examples_quantiles = feature_vis.get("examples_quantiles", None)
+
+            if examples_quantiles is None:
                 examples_quantiles = defaultdict(list)
                 for example in feature.train:
                     examples_quantiles[example.quantile].append(dict(
@@ -372,27 +577,8 @@ class AttributionGraph:
                         examples=examples_quantiles[i],
                     ) for i in sorted(examples_quantiles.keys())
                 ]
-            with torch.no_grad(), torch.autocast("cuda"):
-                try:
-                    logger.disable("attribute.caching")
-                    dec_weight = self.model.w_dec(layer_idx)[feature_idx]
-                finally:
-                    logger.enable("attribute.caching")
-                logits = logit_weight @ dec_weight
-                del dec_weight
-                if self.config.use_logit_bias:
-                    logits += logit_bias
-                top_logits = logits.topk(10).indices.tolist()
-                bottom_logits = logits.topk(10, largest=False).indices.tolist()
-            top_logits = [self.model.decode_token(i) for i in top_logits]
-            bottom_logits = [self.model.decode_token(i) for i in bottom_logits]
+            feature_vis["examples_quantiles"] = examples_quantiles
 
-            feature_vis = dict(
-                index=index,
-                examples_quantiles=examples_quantiles,
-                bottom_logits=bottom_logits,
-                top_logits=top_logits,
-            )
             feature_path.write_text(json.dumps(feature_vis))
             bar.update(1)
             bar.refresh()
@@ -408,7 +594,6 @@ class AttributionGraph:
     def initialize_graph(self):
         num_layers = self.num_layers
         logger.info(f"Initializing graph with {num_layers} layers")
-        assert self.cache.batch_size == 1, "Batch size >1 not supported"
         input_ids = self.input_ids
         seq_len = self.seq_len
         self.nodes_by_layer_and_token = {
@@ -431,6 +616,8 @@ class AttributionGraph:
             self.nodes_by_layer_and_token[0][i].append(input_node)
 
         self.activation_indices_tensors = {}
+        self.intermediate_nodes = {}
+        self.intermediate_nodes_k = {}
         # Create the intermediate nodes
         for layer, activations in self.cache.mlp_outputs.items():
             activations_tensor, indices_tensor = (
@@ -446,7 +633,7 @@ class AttributionGraph:
             for token_position, (top_acts, top_indices) in enumerate(
                 zip(activations_tensor.tolist(), indices_tensor.tolist())
             ):
-                for act, index in zip(top_acts, top_indices):
+                for k_index, (act, index) in enumerate(zip(top_acts, top_indices)):
                     encoder_direction = self.model.w_enc(layer)[index]
                     intermediate_node = IntermediateNode(
                         id=f"intermediate_{token_position}_{layer}_{index}",
@@ -460,6 +647,8 @@ class AttributionGraph:
                     self.nodes_by_layer_and_token[layer][token_position].append(
                         intermediate_node
                     )
+                    self.intermediate_nodes_k[(token_position, layer, k_index)] = intermediate_node
+                    self.intermediate_nodes[(token_position, layer, index)] = intermediate_node
                 # Create the error and skip nodes
                 error = activations.error[0, token_position]
                 error_node = ErrorNode(
@@ -509,6 +698,7 @@ class AttributionGraph:
                 logit=self.logits[-1, top_10_indices[i]].item(),
                 input_vector=gradient[0, -1].to(dtype=torch.bfloat16),
                 layer_index=self.num_layers,
+                logit_idx=i,
             )
             self.nodes[output_node.id] = output_node
             output_nodes.append(output_node)
@@ -518,47 +708,48 @@ class AttributionGraph:
         self.output_nodes = output_nodes
 
         # cleared each time we re-initialize the graph
-        self.queue = NodeQueue()
+        self.queue = AttributionQueue(self.cache, self)
         self.remaining_output_nodes = output_nodes.copy()
 
         self.dead_features = set()
 
     @torch.autocast("cuda")
     def flow_once(self):
-        with measure_time(
-            "Finding a node to compute contributions",
-            disabled=True,
-        ):
-            # if the queue is empty, get the output node with the highest probability
-            # TODO: handle the other output nodes
-            if len(self.output_nodes) > 0:
-                influence, target_node = 1, self.output_nodes.pop()
-                logger.debug("Starting from output node")
-                target_elem = None
-            else:
-                if len(self.queue) == 0:
-                    return False
-                target_elem = self.queue.pop()
-                influence, target_node = target_elem.contribution, target_elem.source
-                logger.debug(f"Doing target: {target_node.id} with influence {influence}")
-                logger.debug("Path:", [(x.source.id, x.weight) for x in target_elem.sequence])
+        true_seq_len = self.cache.input_ids.shape[1]
+        fake_seq_len = self.cache.mlp_outputs[0].source_activation.shape[1]
+        offset = fake_seq_len - true_seq_len
 
-            true_seq_len = self.cache.mlp_outputs[0].error.shape[1]
-            fake_seq_len = self.cache.mlp_outputs[0].source_activation.shape[1]
-            offset = fake_seq_len - true_seq_len
+        gradient = 0
+        mlp_source = False
+        # if the queue is empty, get the output node with the highest probability
+        # TODO: handle the other output nodes
+        if len(self.remaining_output_nodes) > 0:
+            target_node = self.remaining_output_nodes.pop()
+            influences, target_nodes = [target_node.probability], [target_node]
+            logger.debug("Starting from output node")
+        else:
+            if len(self.queue) == 0:
+                return False
+            influences, max_layer, target_indices = self.queue.pop_n(self.config.batch_size)
+            mlp_source = True
+            list_target_indices = target_indices.tolist()
+            target_nodes = [self.intermediate_nodes_k[i, max_layer, j] for i, j in list_target_indices]
 
-            # compute all the contributions
-            max_layer = target_node.layer_index
-            if isinstance(target_node, OutputNode):
-                gradient = target_node.input_vector
-                target_graph_node = self.cache.last_layer_activations[0, target_node.token_position + offset]
-                max_mlp_layer = self.model.num_layers
-            elif isinstance(target_node, IntermediateNode):
-                target_graph_node = self.cache.mlp_outputs[max_layer].activation[0, target_node.token_position]
-                gradient = self.cache.mlp_outputs[max_layer].location[0, target_node.token_position] == target_node.feature_index
-                max_mlp_layer = max_layer
-            else:
-                raise ValueError
+        # compute all the contributions
+        if isinstance(target_nodes[0], OutputNode):
+            max_layer = target_nodes[0].layer_index
+            gradient = target_nodes[0].input_vector
+            target_graph_node = self.cache.last_layer_activations[0, target_nodes[0].token_position + offset]
+            max_mlp_layer = self.model.num_layers
+        elif mlp_source:
+            target_graph_node = self.cache.mlp_outputs[max_layer].activation
+            gradient = None
+            batch_idx = torch.arange(len(target_indices))
+            gradient = torch.zeros_like(target_graph_node)
+            gradient[batch_idx, target_indices[:, 0], target_indices[:, 1]] += 1
+            max_mlp_layer = max_layer
+        else:
+            raise ValueError
 
         backward_to = [self.cache.first_layer_activations] + [
             node
@@ -575,90 +766,91 @@ class AttributionGraph:
             retain_graph=True,
         )
 
-        all_contributions = []
+        with measure_time("Summarizing contributions of node", disabled=True), torch.no_grad():
+            for batch_idx, (target_node, influence) in enumerate(zip(target_nodes, influences)):
+                all_contributions = []
+                for seq_idx in range(target_node.token_position + 1):
+                    contribution = gradients[0][batch_idx, -true_seq_len:][seq_idx] @ backward_to[0][batch_idx, -true_seq_len:][seq_idx]
+                    input_node_name = f"input_{seq_idx}"
+                    source = self.nodes[input_node_name]
+                    assert source.token_position <= target_node.token_position, f"{source.token_position} <= {target_node.token_position}"
+                    all_contributions.append(Contribution(
+                        source=source,
+                        target=target_node,
+                        contribution=contribution.to(device="cpu", non_blocking=True),
+                    ))
+                for layer_idx in range(max_mlp_layer):
+                    error_index = 2 + layer_idx * 2
+                    error_grad, error_val = gradients[error_index], backward_to[error_index]
 
-        with torch.no_grad():
-            for seq_idx in range(target_node.token_position + 1):
-                contribution = gradients[0][0, seq_idx + offset] @ backward_to[0][0, seq_idx + offset]
-                input_node_name = f"input_{seq_idx}"
-                all_contributions.append(Contribution(
-                    source=self.nodes[input_node_name],
-                    target=target_node,
-                    contribution=contribution.cpu(),
-                ))
-        for layer_idx in range(max_mlp_layer):
-            mlp_index = 1 + layer_idx * 2
-            error_index = mlp_index + 1
-            error_grad, error_val = gradients[error_index], backward_to[error_index]
+                    for seq_idx in range(target_node.token_position + 1):
+                        error_contribution = error_grad[batch_idx, -true_seq_len:][seq_idx] @ error_val[batch_idx, -true_seq_len:][seq_idx]
+                        source = self.nodes[f"error_{seq_idx}_{layer_idx}"]
+                        assert source.token_position <= target_node.token_position, f"{source.token_position} <= {target_node.token_position}"
+                        all_contributions.append(Contribution(
+                            source=source,
+                            target=target_node,
+                            contribution=error_contribution.to(device="cpu", non_blocking=True),
+                        ))
 
-            for seq_idx in range(target_node.token_position + 1):
-                error_contribution = error_grad[0, seq_idx + offset] @ error_val[0, seq_idx + offset]
-                all_contributions.append(Contribution(
-                    source=self.nodes[f"error_{seq_idx}_{layer_idx}"],
-                    target=target_node,
-                    contribution=error_contribution.cpu(),
-                ))
+                total_weight = 0
+                edges = {}
+                for layer_idx in range(max_mlp_layer):
+                    mlp_index = 1 + layer_idx * 2
+                    mlp_grad = gradients[mlp_index][batch_idx, -true_seq_len:]
+                    edges[layer_idx] = (mlp_grad * (mlp_grad.abs() > self.config.pre_filter_threshold)).abs()
+                    total_weight += edges[layer_idx].sum()
+                for layer_idx in range(max_mlp_layer):
+                    mlp_index = 1 + layer_idx * 2
+                    edge = edges[layer_idx]
+                    self.queue.layers[layer_idx].contributions += edge / total_weight
+                    mlp_grad = gradients[mlp_index][batch_idx, -true_seq_len:]
+                    n_elem = min(self.config.top_k_edges, (edge > 0).sum().item())
+                    if n_elem == 0:
+                        continue
+                    edge_indices = torch.topk(edge.flatten(), n_elem).indices
+                    edge_seq, edge_k = edge_indices // edge.shape[-1], edge_indices % edge.shape[-1]
+                    edge_feat = self.cache.mlp_outputs[layer_idx].location[batch_idx, -true_seq_len:].flatten()[edge_indices]
+                    edge_val = mlp_grad[edge_seq, edge_k]
+                    self.queue.layers[layer_idx].edge_source_seq.append(edge_seq.to("cpu", non_blocking=True))
+                    self.queue.layers[layer_idx].edge_source_idx.append(edge_feat.to("cpu", non_blocking=True))
+                    self.queue.layers[layer_idx].edge_target_layer.append(target_node.layer_index)
+                    self.queue.layers[layer_idx].edge_target_seq.append(target_node.token_position)
+                    self.queue.layers[layer_idx].edge_target_idx.append(target_node.feature_index if isinstance(target_node, IntermediateNode) else (-1 - target_node.logit_idx))
+                    self.queue.layers[layer_idx].edge_weight.append(edge_val.to("cpu", non_blocking=True))
 
-            mlp_grad = gradients[mlp_index]
-            mlp_grad = mlp_grad[:, -true_seq_len:]
-            edges = (mlp_grad * (mlp_grad.abs() > self.config.pre_filter_threshold)).abs().flatten()
-            _, mlp_grad_indices = edges.topk(min(self.config.top_k_edges, edges.shape[0]))
-            mlp_feature_indices = self.cache.mlp_outputs[layer_idx].location[:, -true_seq_len:].flatten()[mlp_grad_indices]
-            mlp_grad_values = mlp_grad.flatten()[mlp_grad_indices]
-            for grad_val, grad_idx, feature_idx in zip(mlp_grad_values, mlp_grad_indices.tolist(), mlp_feature_indices.tolist()):
-                seq_idx = int(grad_idx // mlp_grad.shape[-1])
-                node_name = f"intermediate_{seq_idx}_{layer_idx}_{feature_idx}"
-                if node_name in self.dense_features:
-                    continue
-                all_contributions.append(Contribution(
-                    source=self.nodes[node_name],
-                    target=target_node,
-                    contribution=grad_val.cpu(),
-                ))
-
-        with measure_time(
-            f"Summarizing contributions of node {target_node.id}",
-            disabled=True,
-        ):
-            with measure_time(
-                f"Creating sources for {target_node.id}",
-                disabled=True,
-            ):
                 # Make new paths using the last path
-                new_sources = []
                 for n_path in range(0, len(all_contributions)):
                     new_contribution = all_contributions[n_path]
                     new_source = new_contribution.source
-                    weight = new_contribution.contribution
-                    # if isinstance(new_source, IntermediateNode):
-                    #     weight *= new_source.activation
+                    assert new_source.token_position <= target_node.token_position, f"{new_source.token_position} <= {target_node.token_position}"
+                    weight = float(new_contribution.contribution)
                     edge = Edge(
                         source=new_source,
                         target=target_node,
                         weight=float(weight),
                     )
                     self.edges[edge.id] = edge
-                    # if path ends with input node or error node, it is finished and we don't want to add it to the queue
-                    if (
-                        isinstance(new_source, InputNode)
-                        or isinstance(new_source, ErrorNode)
-                    ):
-                        continue
-                    new_sources.append(
-                        QueueElement(
-                            source=new_source,
-                            weight=abs(new_contribution.contribution),
-                            parent=target_elem,
-                        )
-                    )
 
-            self.queue.add_many(new_sources, self.config.top_k_edges)
+        if mlp_source:
+            for source_layer, source_seq, source_idx, target_layer, target_seq, target_idx, weight in self.queue.purge():
+                source = self.intermediate_nodes[(source_seq, source_layer, source_idx)]
+                if target_idx < 0:
+                    target = self.output_nodes[-1 - target_idx]
+                else:
+                    target = self.intermediate_nodes[(target_seq, target_layer, target_idx)]
+                edge = Edge(
+                    source=source,
+                    target=target,
+                    weight=weight
+                )
+                self.edges[edge.id] = edge
 
-        return len(self.queue) > 0 or target_elem is None
+        return len(self.queue) > 0 or not mlp_source
 
     def flow(self, num_iterations: Optional[int] = None):
         if num_iterations is None:
-            num_iterations = self.config.flow_steps
+            num_iterations = self.config.flow_steps // self.config.batch_size
         for i in (bar := trange(num_iterations, desc="Flowing contributions")):
             with measure_time(
                 f"Iteration {i}",
@@ -672,84 +864,67 @@ class AttributionGraph:
 
 
 @dataclass
-class QueueElement:
-    source: Node
-    weight: float
-    parent: Optional["QueueElement"] = None
-
-    def __hash__(self):
-        return hash((self.source.id, self.weight, hash(self.parent)))
-
-    @property
-    @infcache
-    def contribution(self):
-        if self.parent is None:
-            return self.weight
-        else:
-            return self.weight * self.parent.contribution
-
-    @property
-    @infcache
-    def key(self):
-        key = self.contribution  # ** (1 / len(self.sequence))
-        if isinstance(self.source, IntermediateNode):
-            key *= abs(self.source.activation)
-        return -abs(key)
-
-    def __lt__(self, other):
-        return self.key < other.key
-
-    def __eq__(self, other):
-        return self.source.id == other.source.id
-
-    @property
-    @infcache
-    def sequence(self):
-        own = [self]
-        if self.parent is None:
-            return own
-        else:
-            return own + self.parent.sequence
+class AttributionLayer:
+    visited: Bool[Array, "seq_len k"]
+    contributions: Float[Array, "seq_len k"]
+    edge_source_seq: list[Int[Array, "..."]]
+    edge_source_idx: list[Int[Array, "..."]]
+    edge_target_layer: list[Int[Array, "..."]]
+    edge_target_seq: list[Int[Array, "..."]]
+    edge_target_idx: list[Int[Array, "..."]]
+    edge_weight: list[Float[Array, "..."]]
 
 
-class NodeQueue:
-    def __init__(self):
-        self.visited = set()
-        self.unvisited = {}
+class AttributionQueue:
+    def __init__(self, cache: TranscodedOutputs, graph: AttributionGraph):
+        self.graph = graph
+        self.cache = cache
+        self.layers = {
+            layer: AttributionLayer(
+                visited=torch.zeros(output.activation.shape[1:], device=cache.input_ids.device, dtype=torch.bool),
+                contributions=torch.zeros(output.activation.shape[1:], device=cache.input_ids.device, dtype=torch.float32),
+                edge_source_seq=[],
+                edge_source_idx=[],
+                edge_target_layer=[],
+                edge_target_seq=[],
+                edge_target_idx=[],
+                edge_weight=[],
+            )
+            for layer, output in cache.mlp_outputs.items()
+        }
+
+    @torch.no_grad()
+    def contribution_not_visited(self, layer: int):
+        return (self.layers[layer].contributions * ~self.layers[layer].visited * self.cache.mlp_outputs[layer].activation[0]).flatten()
+
+    @torch.no_grad()
+    def pop_n(self, n: int):
+        layer = random.choice(list(layer for layer in self.layers.keys() if self.contribution_not_visited(layer).sum().item() > 0))
+        contribution_not_visited = self.contribution_not_visited(layer)
+        n_to_visit = min(n, (contribution_not_visited > 0).sum().item())
+        contribution, visited = torch.topk(contribution_not_visited, n_to_visit)
+        k = self.layers[layer].contributions.shape[-1]
+        visited_seq, visited_k = visited // k, visited % k
+        self.layers[layer].visited[visited_seq, visited_k] = True
+        return contribution.tolist(), layer, torch.stack([visited_seq, visited_k], dim=-1)
 
     def __len__(self):
-        return len(self.unvisited)
+        return sum((self.contribution_not_visited(layer) > 0).sum().item() for layer in self.layers.keys())
 
-    def pop(self):
-        all_layers = set(x.source.layer_index for x in self.unvisited.values())
-        random_layer = random.choice(list(all_layers))
-        unvisited = {x: y for x, y in self.unvisited.items() if y.source.layer_index == random_layer}
-        highest = min(unvisited, key=lambda x: self.unvisited[x].key)
-        if highest in self.visited:
-            del self.unvisited[highest]
-            return self.pop()
-        return self.unvisited.pop(highest)
-
-    def add(self, node: QueueElement):
-        if node.source.id in self.visited:
-            return
-        if node.source.id in self.unvisited:
-            if node.key < self.unvisited[node.source.id].key:
-                self.unvisited[node.source.id] = node
-        else:
-            self.unvisited[node.source.id] = node
-
-    def add_many(self, nodes: list[QueueElement], top_k: int = float("inf")):
-            with measure_time("Deduplicating", disabled=True):
-                new_sources = [x for x in nodes if x.source.id not in self.visited]
-            with measure_time("Creating keys to sort", disabled=True):
-                keys = [float(x.key) for x in new_sources]
-            with measure_time("Sorting", disabled=True):
-                if len(keys) > top_k:
-                    topk_sort = np.argpartition(keys, top_k)[:top_k]
-                else:
-                    topk_sort = np.arange(len(keys))
-                filtered_sources = [new_sources[i] for i in topk_sort]
-            with measure_time("Adding to queue", disabled=True):
-                for source in filtered_sources:
-                    self.add(source)
+    def purge(self):
+        for layer_idx, layer in self.layers.items():
+            while len(layer.edge_source_seq) > 0:
+                source_seqs, source_idces, weights = (
+                    layer.edge_source_seq.pop().tolist(),
+                    layer.edge_source_idx.pop().tolist(),
+                    layer.edge_weight.pop().tolist(),
+                )
+                target_layer, target_seq, target_idx = (
+                    int(layer.edge_target_layer.pop()),
+                    int(layer.edge_target_seq.pop()),
+                    int(layer.edge_target_idx.pop()),
+                )
+                for source_seq, source_idx, weight in zip(source_seqs, source_idces, weights):
+                    if weight == 0:
+                        continue
+                    yield layer_idx, source_seq, source_idx, target_layer, target_seq, target_idx, weight

@@ -48,6 +48,9 @@ def load_artifacts(run_cfg: RunConfig):
         run_cfg,
         compile=True,
     )
+    if run_cfg.hook_resid_mid:
+        hookpoint_to_sparse_encode = {h.replace(".mlp", ".post_attention_layernorm"): hookpoint_to_sparse_encode[h] for h in run_cfg.hookpoints}
+        run_cfg.hookpoints = [h.replace(".mlp", ".post_attention_layernorm") for h in run_cfg.hookpoints]
 
     return run_cfg.hookpoints, hookpoint_to_sparse_encode, model, transcode
 
@@ -174,6 +177,8 @@ async def run(
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_arguments(RunConfig, dest="run_cfg")
+    parser.add_argument("--hook_resid_mid", action="store_true")
     args = parser.parse_args()
+    args.run_cfg.hook_resid_mid = args.hook_resid_mid
 
     asyncio.run(run(args.run_cfg))
