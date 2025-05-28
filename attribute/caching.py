@@ -11,6 +11,7 @@ from clt.config import CLTConfig
 from clt.models.clt import CrossLayerTranscoder
 from jaxtyping import Array, Float, Int
 from loguru import logger
+from safetensors.torch import load_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.gpt2 import GPT2PreTrainedModel
@@ -102,8 +103,7 @@ class TranscodedModel(object):
         logger.info(f"Loading transcoders from {transcoder_path}")
         transcoder_path = Path(transcoder_path)
 
-        clt_cfg_path = os.path.join(transcoder_path, "cfg.json")
-        clt_ckpt_path = os.path.join(transcoder_path, "clt_checkpoint_latest.pt")
+        clt_cfg_path = transcoder_path / "cfg.json"
 
         with open(clt_cfg_path, "r") as f:
             config_dict = json.load(f)
@@ -111,7 +111,18 @@ class TranscodedModel(object):
 
         # Create and load model
         self.clt = CrossLayerTranscoder(clt_config, process_group=None, device=device)
-        self.clt.load_state_dict(torch.load(clt_ckpt_path, map_location=device))
+        clt_ckpt_path = transcoder_path / "clt_checkpoint_latest.safetensors"
+        if clt_ckpt_path.exists():
+            weights = load_file(clt_ckpt_path, device=device)
+        elif (clt_ckpt_path.with_suffix(".pt")).exists():
+            weights = torch.load(
+                clt_ckpt_path.with_suffix(".pt"),
+                map_location=device,
+                weights_only=False,
+            )
+        else:
+            raise FileNotFoundError(f"No CLT checkpoint found at {clt_ckpt_path}")
+        self.clt.load_state_dict(weights)
 
         self.hookpoints_layer = [
             f"{self.layer_prefix}.{i}" for i in range(self.num_layers)
@@ -278,7 +289,7 @@ class TranscodedModel(object):
         if last_layer_activations.requires_grad:
             last_layer_activations.retain_grad()
 
-        k = self.clt.config.batchtopk_k or self.clt.config.topk_k
+        k = self.clt.config.batchtopk_k or self.clt.config.topk_k or 128
         mlp_outputs = {}
         for i in range(self.num_layers):
             source_activation = source_activations[i]
@@ -416,7 +427,7 @@ class TranscodedModel(object):
                 weight_combined += self.w_dec(layer_idx, target_layer_idx)
             return weight_combined
         assert target_layer_idx >= layer_idx
-        decoder = self.clt.decoders[f"{layer_idx}->{target_layer_idx}"]
+        decoder = self.clt.decoder.decoders[f"{layer_idx}->{target_layer_idx}"]
         return decoder.weight
 
     def w_skip(
@@ -425,7 +436,7 @@ class TranscodedModel(object):
         raise NotImplementedError()
 
     def w_enc(self, layer_idx: int) -> Float[Array, "features hidden_size"]:
-        return self.clt.encoders[layer_idx].weight
+        return self.clt.encoder.encoders[layer_idx].weight
 
     def attn(self, layer_idx: int) -> torch.nn.Module:
         layer = self.model.get_submodule(self.layer_prefix)[layer_idx]
