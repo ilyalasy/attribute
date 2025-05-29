@@ -325,9 +325,6 @@ class TranscodedModel(object):
             error.requires_grad_(True)
             logger.info(f"Layer {module_name} error: {diff.norm() / output.norm()}")
 
-            target_activations[module_name] = target_latent_acts
-            source_activations[module_name] = source_latent_acts
-
             result = (transcoder_out + error).to(output)
             errors[module_name] = error
             return result
@@ -359,16 +356,13 @@ class TranscodedModel(object):
         k = self.clt.config.batchtopk_k or self.clt.config.topk_k or 128
         mlp_outputs = {}
         for i in range(self.num_layers):
-            source_activation = source_activations[i]
-            source_activation, indices = source_activation.topk(k, dim=-1)
-            target_activation = target_activations[i]
-            target_activation, _ = target_activation.topk(k, dim=-1)
+            _, top_indices = torch.sort(source_activations[i], dim=-1, descending=True)
 
             mlp_outputs[i] = MLPOutputs(
                 ln_factor=second_ln[self.hookpoints_ln[i]],
-                activation=target_activation,
-                source_activation=source_activation,
-                location=indices,
+                activation=target_activations[i],
+                source_activation=source_activations[i],
+                location=top_indices,
                 error=errors[self.hookpoints_mlp[i]],
                 source_error=errors[self.hookpoints_mlp[i]],
                 l0=l0s[self.hookpoints_mlp[i]],
@@ -498,7 +492,7 @@ class TranscodedModel(object):
                 weight_combined += self.w_dec(layer_idx, target_layer_idx)
             return weight_combined
         assert target_layer_idx >= layer_idx
-        decoder = self.clt.decoder.decoders[f"{layer_idx}->{target_layer_idx}"]
+        decoder = self.clt.decoder_module.decoders[f"{layer_idx}->{target_layer_idx}"]
         return decoder.weight
 
     def w_skip(
@@ -507,7 +501,7 @@ class TranscodedModel(object):
         raise NotImplementedError()
 
     def w_enc(self, layer_idx: int) -> Float[Array, "features hidden_size"]:
-        return self.clt.encoder.encoders[layer_idx].weight
+        return self.clt.encoder_module.encoders[layer_idx].weight
 
     def get_layer(self, layer_idx: int) -> torch.nn.Module:
         return self.model.get_submodule(self.layer_prefix)[layer_idx]
