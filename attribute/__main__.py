@@ -4,20 +4,20 @@ from pathlib import Path
 import fire
 from loguru import logger
 
-from .caching import TranscodedModel
-from .mlp_attribution import AttributionConfig, AttributionGraph
+from attribute.caching import TranscodedModel
+from attribute.mlp_attribution import AttributionConfig, AttributionGraph
 
 
 async def main(
-    prompt="When John and Mary went to the store, John gave a bag to",
-    model_name="HuggingFaceTB/SmolLM2-135M",
-    save_dir = Path("attribution-graphs-frontend"),
-    transcoder_path = "/mnt/ssd-1/gpaulo/smollm-decomposition/sparsify/checkpoints/single_128x",
-    cache_path = "/mnt/ssd-1/gpaulo/smollm-decomposition/attribution_graph/results/transcoder_128x/latents",
-    name = "test-1-ts",
-    scan = "default",
-    remove_prefix = 0,
-    pre_ln_hook = False,
+    prompt="Once in a land of ice and snow, there lived a boy named",
+    model_name="SimpleStories/SimpleStories-35M",
+    save_dir=Path("attribution-graphs-frontend"),
+    transcoder_path="/share/ilya.lasy/transcoders/clt-16k-jumprelu",
+    cache_path="/share/ilya.lasy/attribution_graph/",
+    name="test-1-ts",
+    scan="default",
+    remove_prefix=0,
+    pre_ln_hook=False,
     **kwargs,
 ):
     logger.remove()
