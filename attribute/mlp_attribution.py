@@ -41,12 +41,15 @@ class AttributionConfig:
     filter_high_freq_early: float = 0.01
 
     # remove MLP edges below this threshold
-    pre_filter_threshold: float = 1e-3
+    # pre_filter_threshold: float = 1e-3
+    pre_filter_threshold: float = 0.0
     # keep edges that make up this fraction of the total influence
-    edge_cum_threshold: float = 0.95
+    edge_cum_threshold: float = 0.98
     # keep top k edges for each node
-    top_k_edges: int = 32
-
+    # top_k_edges: int = 32
+    top_k_edges: int = 1024
+    # whether to multiply by activation strength before computing influence
+    influence_anthropic: bool = True
     # keep nodes that make up this fraction of the total influence
     node_cum_threshold: float = 0.8
     # keep per_layer_position nodes above this threshold for each layer/position pair
@@ -143,6 +146,20 @@ class AttributionGraph:
             latents=module_latents,
         )
 
+    def find_influence(self, adj_matrix: np.ndarray, activation_sources: np.ndarray):
+        n_initial = adj_matrix.shape[0]
+        if self.config.influence_anthropic:
+            adj_matrix = np.abs(adj_matrix) * activation_sources
+            adj_matrix = adj_matrix / np.maximum(1e-5, adj_matrix.sum(axis=1, keepdims=True))
+            influence = np.linalg.inv(np.eye(n_initial) - adj_matrix) - np.eye(n_initial)
+        else:
+            influence = np.linalg.inv(np.eye(n_initial) - adj_matrix) - np.eye(n_initial)
+            influence = np.abs(influence) * activation_sources
+            influence = influence / np.maximum(1e-2, influence.sum(axis=1, keepdims=True))
+            adj_matrix = np.abs(adj_matrix) * activation_sources
+            adj_matrix = adj_matrix / np.maximum(1e-2, adj_matrix.sum(axis=1, keepdims=True))
+        return influence, adj_matrix
+
     def save_graph(self, save_dir: os.PathLike):
         save_dir = Path(save_dir)
         logger.info("Saving graph to", save_dir)
@@ -170,19 +187,8 @@ class AttributionGraph:
                 activation_sources[index] = node.activation
 
         logger.info("Finding influence matrix")
-        if not hasattr(self, "influence"):
-            identity = np.eye(n_initial)
-            influence = np.linalg.inv(identity - adj_matrix) - identity
-            self.influence = influence
-        else:
-            influence = self.influence
-
         original_adj_matrix = adj_matrix
-
-        influence = np.abs(influence) * activation_sources
-        influence = influence / np.maximum(1e-2, influence.sum(axis=1, keepdims=True))
-        adj_matrix = np.abs(adj_matrix) * activation_sources
-        adj_matrix = adj_matrix / np.maximum(1e-2, adj_matrix.sum(axis=1, keepdims=True))
+        influence, adj_matrix = self.find_influence(original_adj_matrix, activation_sources)
 
         total_error_influence = 1 - (influence_sources @ adj_matrix) @ error_mask
         logger.info(f"Completeness score (unpruned): {total_error_influence:.3f}")
@@ -193,16 +199,58 @@ class AttributionGraph:
         usage = influence_sources @ influence
         logger.info(f"Top influences: {usage[np.argsort(usage)[-10:][::-1]].tolist()}")
 
+        # if False:
+        #     edge_matrix = torch.load("../circuit-replicate/edge_matrix.pt")
+        #     logit_weights = edge_matrix["logit_weights"]
+
+        #     def normalize_matrix(matrix: torch.Tensor) -> torch.Tensor:
+        #         normalized = matrix.abs()
+        #         return normalized / normalized.sum(dim=1, keepdim=True).clamp(min=1e-10)
+
+        #     def compute_influence(A):
+        #         # Calculate total influence using matrix inverse (I - A)^-1 - I
+        #         I = torch.eye(A.shape[0], device=A.device)
+        #         B = torch.inverse(I - A) - I
+        #         return logit_weights @ B
+
+        #     # Calculate node influence and apply threshold
+        #     node_influence = compute_influence(normalize_matrix(edge_matrix["edge_matrix"]))
+
+        #     xs = []
+        #     ys = []
+        #     for i, (layer_idx, seq_idx, feature_idx) in enumerate(edge_matrix["activation_matrix_indices"].tolist()):
+        #         seq_idx = seq_idx - 1
+        #         try:
+        #             node_id = self.intermediate_nodes[(seq_idx, layer_idx, feature_idx)].id
+        #         except KeyError:
+        #             continue
+        #         try:
+        #             print(dedup_node_indices[node_id])
+        #         except KeyError:
+        #             continue
+        #         xs.append(node_influence[i].item())
+        #         ys.append(usage[dedup_node_indices[node_id]])
+        #     from matplotlib import pyplot as plt
+        #     plt.scatter(xs, ys)
+        #     plt.plot([0, 0.05], [0, 0.05], color="black")
+        #     plt.xlabel("Theirs")
+        #     plt.ylabel("Ours")
+        #     plt.title(f"R^2: {np.corrcoef(xs, ys)[0, 1]**2:.3f}")
+        #     plt.savefig("results/influence_vs_usage.png")
+        #     # 1/0
+
         logger.info("Selecting nodes and edges")
         selected_nodes = [node for i, node in enumerate(dedup_node_names)
                   if self.nodes[node].node_type in ("OutputNode",)
                   + (("InputNode",) if self.config.keep_all_input_nodes else ())
-                  + (("ErrorNode",) if self.config.keep_all_error_nodes else ())]
+                  + (("ErrorNode",) if self.config.keep_all_error_nodes else ())
+                  and self.nodes[node].token_position >= 0]
 
         sorted_usage = np.sort(usage)[::-1]
         cumsum_usage = np.cumsum(sorted_usage)
         cumsum_usage = cumsum_usage / cumsum_usage[-1]
         node_threshold = sorted_usage[np.searchsorted(cumsum_usage, self.config.node_cum_threshold)]
+        logger.info(f"Node threshold: {node_threshold}")
 
         for seq_idx in range(self.cache.input_ids.shape[-1]):
             for layer_idx in range(self.num_layers):
@@ -235,29 +283,30 @@ class AttributionGraph:
         filtered_index = np.cumsum(filtered_mask) - 1
 
         filtered_adj_matrix = original_adj_matrix[filtered_mask][:, filtered_mask]
-        filtered_influence = np.linalg.inv(np.eye(len(filtered_adj_matrix)) - filtered_adj_matrix) - np.eye(len(filtered_adj_matrix))
-
-        filtered_influence = np.abs(filtered_influence) * activation_sources[filtered_mask]
-        filtered_influence = filtered_influence / np.maximum(1e-2, filtered_influence.sum(axis=1, keepdims=True))
-        filtered_adj_matrix = np.abs(filtered_adj_matrix) * activation_sources[filtered_mask]
-        filtered_adj_matrix = filtered_adj_matrix / np.maximum(1e-2, filtered_adj_matrix.sum(axis=1, keepdims=True))
+        filtered_influence, filtered_adj_matrix = self.find_influence(filtered_adj_matrix, activation_sources[filtered_mask])
+        filtered_node_influence = influence_sources[filtered_mask] @ filtered_influence
+        filtered_influence = filtered_adj_matrix * (filtered_node_influence + influence_sources[filtered_mask])[None, :]
 
         total_pruned_influence = float(1 - (influence_sources[filtered_mask] @ filtered_adj_matrix) @ error_mask[filtered_mask])
         logger.info(f"Completeness score: {total_pruned_influence:.3f}")
-        total_pruned_influence = float(1 - (influence_sources[filtered_mask] @ filtered_influence) @ error_mask[filtered_mask])
+        total_pruned_influence = float(1 - filtered_node_influence @ error_mask[filtered_mask])
         logger.info(f"Replacement score: {total_pruned_influence:.3f}")
-
-        export_nodes = []
-        for n in selected_nodes:
-            export_nodes.append(self.nodes[n])
-        self.exported_nodes = export_nodes
 
         selected_edge_matrix = np.sort(filtered_influence.flatten())[::-1]
         edge_cumsum = np.cumsum(selected_edge_matrix)
         edge_cumsum = edge_cumsum / edge_cumsum[-1]
+
+        # from matplotlib import pyplot as plt
+        # plt.loglog(1 - edge_cumsum)
+        # plt.plot([0, 10000], [0.02, 0.02], "k--")
+        # plt.savefig("results/edge_cumsum.png")
+
         edge_threshold = selected_edge_matrix[np.searchsorted(edge_cumsum, self.config.edge_cum_threshold)]
+        logger.info(f"Edge threshold: {edge_threshold}")
 
         export_edges = []
+        has_incoming = set()
+        has_outgoing = set()
         for edge in self.edges.values():
             if not (edge.source.id in selected_nodes and edge.target.id in selected_nodes):
                 continue
@@ -266,9 +315,22 @@ class AttributionGraph:
                                    filtered_index[dedup_node_indices[edge.source.id]]]
                 ) < edge_threshold:
                 continue
+            has_outgoing.add(edge.source.id)
+            has_incoming.add(edge.target.id)
             export_edges.append(edge)
         self.exported_edges = export_edges
         logger.info(f"Selected {len(export_edges)} edges")
+
+        export_nodes = []
+        for n in selected_nodes:
+            if isinstance(self.nodes[n], IntermediateNode):
+                if n not in has_incoming or n not in has_outgoing:
+                    continue
+            if isinstance(self.nodes[n], ErrorNode):
+                if n not in has_outgoing:
+                    continue
+            export_nodes.append(self.nodes[n])
+        self.exported_nodes = export_nodes
 
         logger.info("Exporting graph")
         tokens = [self.model.decode_token(i) for i in self.input_ids]
@@ -594,26 +656,29 @@ class AttributionGraph:
     def initialize_graph(self):
         num_layers = self.num_layers
         logger.info(f"Initializing graph with {num_layers} layers")
-        input_ids = self.input_ids
         seq_len = self.seq_len
         self.nodes_by_layer_and_token = {
             layer: {token: [] for token in range(seq_len)}
             for layer in range(num_layers)
         }
 
+        offset = self.cache.mlp_outputs[0].source_activation.shape[1] - seq_len
+
         # Start by creating the input nodes
-        for i in range(0, seq_len):
-            embedding = self.model.embedding_weight[input_ids[i]]
+        og_input_ids = self.cache.original_input_ids[0]
+        for i in range(-offset, seq_len):
+            embedding = self.model.embedding_weight[og_input_ids[i]]
             input_node = InputNode(
                 id=f"input_{i}",
                 token_position=i,
-                token_idx=input_ids[i],
-                token_str=self.tokenizer.decode([input_ids[i]]),
+                token_idx=og_input_ids[i],
+                token_str=self.tokenizer.decode([og_input_ids[i]]),
                 output_vector=embedding.to(dtype=torch.bfloat16),
                 layer_index=-1,
             )
             self.nodes[input_node.id] = input_node
-            self.nodes_by_layer_and_token[0][i].append(input_node)
+            if i >= 0:
+                self.nodes_by_layer_and_token[0][i].append(input_node)
 
         self.activation_indices_tensors = {}
         self.intermediate_nodes = {}
@@ -769,11 +834,10 @@ class AttributionGraph:
         with measure_time("Summarizing contributions of node", disabled=True), torch.no_grad():
             for batch_idx, (target_node, influence) in enumerate(zip(target_nodes, influences)):
                 all_contributions = []
-                for seq_idx in range(target_node.token_position + 1):
-                    contribution = gradients[0][batch_idx, -true_seq_len:][seq_idx] @ backward_to[0][batch_idx, -true_seq_len:][seq_idx]
+                for seq_idx in range(-offset, target_node.token_position + 1):
+                    contribution = gradients[0][batch_idx][seq_idx + offset] @ backward_to[0][batch_idx][seq_idx + offset]
                     input_node_name = f"input_{seq_idx}"
                     source = self.nodes[input_node_name]
-                    assert source.token_position <= target_node.token_position, f"{source.token_position} <= {target_node.token_position}"
                     all_contributions.append(Contribution(
                         source=source,
                         target=target_node,
@@ -793,17 +857,11 @@ class AttributionGraph:
                             contribution=error_contribution.to(device="cpu", non_blocking=True),
                         ))
 
-                total_weight = 0
-                edges = {}
                 for layer_idx in range(max_mlp_layer):
                     mlp_index = 1 + layer_idx * 2
                     mlp_grad = gradients[mlp_index][batch_idx, -true_seq_len:]
-                    edges[layer_idx] = (mlp_grad * (mlp_grad.abs() > self.config.pre_filter_threshold)).abs()
-                    total_weight += edges[layer_idx].sum()
-                for layer_idx in range(max_mlp_layer):
-                    mlp_index = 1 + layer_idx * 2
-                    edge = edges[layer_idx]
-                    self.queue.layers[layer_idx].contributions += edge / total_weight
+                    edge = (mlp_grad * (mlp_grad.abs() > self.config.pre_filter_threshold)).abs() * influence * self.cache.mlp_outputs[layer_idx].activation[0]
+                    self.queue.layers[layer_idx].contributions += edge
                     mlp_grad = gradients[mlp_index][batch_idx, -true_seq_len:]
                     n_elem = min(self.config.top_k_edges, (edge > 0).sum().item())
                     if n_elem == 0:
@@ -894,8 +952,8 @@ class AttributionQueue:
         }
 
     @torch.no_grad()
-    def contribution_not_visited(self, layer: int):
-        return (self.layers[layer].contributions * ~self.layers[layer].visited * self.cache.mlp_outputs[layer].activation[0]).flatten()
+    def contribution_not_visited(self, layer: int, multiply_by_activation: bool = False):
+        return (self.layers[layer].contributions * ~self.layers[layer].visited * (self.cache.mlp_outputs[layer].activation[0] if multiply_by_activation else 1)).flatten()
 
     @torch.no_grad()
     def pop_n(self, n: int):

@@ -25,6 +25,9 @@ dependencies = [
     "neuronpedia>=1.0.20",
 ]
 
+[tool.setuptools]
+packages = ["attribute"]
+
 [[tool.uv.index]]
 name = "pytorch"
 url = "https://download.pytorch.org/whl/cu128"

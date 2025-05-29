@@ -58,6 +58,7 @@ class TranscodedOutputs:
 
     def remove_prefix(self, remove_prefix: int):
         if remove_prefix > 0:
+            self.original_input_ids = self.input_ids
             self.input_ids = self.input_ids[:, remove_prefix:]
             # only ever accessed w/ [-1], removing BOS doesn't matter
             # transcoded_outputs.last_layer_activations = transcoded_outputs.last_layer_activations[:, 1:]

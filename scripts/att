@@ -4,10 +4,10 @@ PROMPT_NAME="basketball-llama"
 # PROMPT_NAME="basketball-smollm"
 # PROMPT_NAME="basketball-llama-base"
 # SCAN=transcoder_llama_131k_highbs_v0
-# SCAN=transcoder_llama_131k_mntss
+SCAN=transcoder_llama_131k_mntss
 # SCAN=transcoder_llama_131k_mntss_kl
 # SCAN=transcoder_llama_131k_adam
-SCAN=transcoder-llama-131k-adam-kl
+# SCAN=transcoder-llama-131k-adam-kl
 # SCAN=smollm_v0
 set -e
 PROMPT_TEXT="Michael Jordan plays the sport of"
@@ -16,8 +16,8 @@ uv run python -m attribute \
 --name $PROMPT_NAME \
 --scan "$SCAN" \
 "$PROMPT_TEXT" \
---transcoder_path="/mnt/ssd-1/nev/sparsify/checkpoints/llama-finetune/adam" --model_name="meta-llama/Llama-3.2-1B" --remove_prefix 1 \
-# --transcoder_path="results/llama-mntss-relu" --model_name="meta-llama/Llama-3.2-1B" --remove_prefix 1 --pre_ln_hook=True \
+--transcoder_path="results/llama-mntss-relu" --model_name="meta-llama/Llama-3.2-1B" --remove_prefix 1 --pre_ln_hook=True \
+# --transcoder_path="/mnt/ssd-1/nev/sparsify/checkpoints/llama-finetune/adam" --model_name="meta-llama/Llama-3.2-1B" --remove_prefix 1 \
 # --transcoder_path="/mnt/ssd-1/nev/e2e/checkpoints/llama/anneal-adam" --model_name="meta-llama/Llama-3.2-1B" --remove_prefix 1 \
 # --transcoder_path="/mnt/ssd-1/nev/sparsify/checkpoints/llama-finetune-rmid/kl" --model_name="meta-llama/Llama-3.2-1B" --remove_prefix 1 --pre_ln_hook=True \
 # --transcoder_path="/mnt/ssd-1/nev/e2e/checkpoints/smollm" --model_name="HuggingFaceTB/SmolLM2-135M" \
