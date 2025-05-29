@@ -860,6 +860,9 @@ class AttributionGraph:
                 for layer_idx in range(max_mlp_layer):
                     mlp_index = 1 + layer_idx * 2
                     mlp_grad = gradients[mlp_index][batch_idx, -true_seq_len:]
+                    # take topk grads to match target activations dim
+                    indices = self.cache.mlp_outputs[layer_idx].location[batch_idx, -true_seq_len:]
+                    mlp_grad = mlp_grad.gather(dim=-1, index=indices)
                     edge = (mlp_grad * (mlp_grad.abs() > self.config.pre_filter_threshold)).abs() * influence * self.cache.mlp_outputs[layer_idx].activation[0]
                     self.queue.layers[layer_idx].contributions += edge
                     mlp_grad = gradients[mlp_index][batch_idx, -true_seq_len:]

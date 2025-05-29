@@ -33,7 +33,7 @@ GPT2Like = GPT2PreTrainedModel | GPTNeoPreTrainedModel
 class MLPOutputs:
     ln_factor: Float[Array, "batch seq_len hidden_size"]
     activation: Float[Array, "batch seq_len k"]
-    source_activation: Float[Array, "batch seq_len k"]
+    source_activation: Float[Array, "batch seq_len latent_size"]
     location: Int[Array, "batch seq_len k"]
     error: Float[Array, "batch seq_len hidden_size"]
     source_error: Float[Array, "batch seq_len hidden_size"]
@@ -57,8 +57,8 @@ class TranscodedOutputs:
         return self.input_ids.shape[0]
 
     def remove_prefix(self, remove_prefix: int):
+        self.original_input_ids = self.input_ids
         if remove_prefix > 0:
-            self.original_input_ids = self.input_ids
             self.input_ids = self.input_ids[:, remove_prefix:]
             # only ever accessed w/ [-1], removing BOS doesn't matter
             # transcoded_outputs.last_layer_activations = transcoded_outputs.last_layer_activations[:, 1:]
@@ -357,11 +357,16 @@ class TranscodedModel(object):
         k = self.clt.config.batchtopk_k or self.clt.config.topk_k or 128
         mlp_outputs = {}
         for i in range(self.num_layers):
-            _, top_indices = torch.sort(source_activations[i], dim=-1, descending=True)
+            target_activation = target_activations[i]
+            target_activation, top_indices = torch.topk(
+                target_activation,
+                k,
+                dim=-1,
+            )
 
             mlp_outputs[i] = MLPOutputs(
                 ln_factor=second_ln[self.hookpoints_ln[i]],
-                activation=target_activations[i],
+                activation=target_activation,
                 source_activation=source_activations[i],
                 location=top_indices,
                 error=errors[self.hookpoints_mlp[i]],
@@ -494,7 +499,7 @@ class TranscodedModel(object):
             return weight_combined
         assert target_layer_idx >= layer_idx
         decoder = self.clt.decoder_module.decoders[f"{layer_idx}->{target_layer_idx}"]
-        return decoder.weight
+        return decoder.weight.T
 
     def w_skip(
         self, layer_idx: int, target_layer_idx: int | None = None
