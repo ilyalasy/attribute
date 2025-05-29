@@ -33,13 +33,13 @@ def parse_args():
     parser.add_argument(
         "--model",
         type=str,
-        default="roneneldan/TinyStories-33M",
+        default="SimpleStories/SimpleStories-35M",
         help="Model name or path",
     )
     parser.add_argument(
         "--transcoder_path",
         type=str,
-        default="/share/ilya.lasy/transcoders/clt-128",
+        default="/share/ilya.lasy/transcoders/clt-16k-jumprelu",
         help="Path to transcoder",
     )
     parser.add_argument(
@@ -78,23 +78,23 @@ def main():
         transcoder_path=args.transcoder_path if args.mlp_trim == 0 else None,
     )
 
-    dataset_name = "roneneldan/TinyStories"
+    dataset_name = "SimpleStories/SimpleStories"
     # Load and preprocess dataset into fixed-length chunks for efficient batching
     dataset = load_dataset(dataset_name, split="train").select(
-        range(10000)
+        range(1000)
     )  # Load only 10k samples
     dataset = chunk_and_tokenize(
         dataset,
         model.tokenizer,
         max_seq_len=args.max_seq_len,
-        num_proc=cpu_count() // 2,
-        text_key="text",
+        num_proc=cpu_count() // 4,
+        text_key="story",
     )
 
     # Setup data loading with multiprocessing
     logger.remove()  # Remove default logger to avoid clutter during evaluation
     dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=args.batch_size, num_workers=cpu_count() // 2
+        dataset, batch_size=args.batch_size, num_workers=cpu_count() // 4
     )
 
     # Track metrics across batches
